@@ -82,11 +82,9 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
   // try extracting the image reference from the guide's cover page XHTML
   if (bookMetadata.coverItemHref.empty() && !opfParser.guideCoverPageHref.empty()) {
     LOG_DBG("EBP", "No cover from metadata, trying guide cover page: %s", opfParser.guideCoverPageHref.c_str());
-    size_t coverPageSize;
-    uint8_t* coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, &coverPageSize, true);
-    if (coverPageData) {
-      const std::string coverPageHtml(reinterpret_cast<char*>(coverPageData), coverPageSize);
-      free(coverPageData);
+    const auto coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, true);
+    if (!coverPageData.empty()) {
+      const std::string_view coverPageHtml(reinterpret_cast<const char*>(coverPageData.data()), coverPageData.size());
 
       // Determine base path of the cover page for resolving relative image references
       std::string coverPageBase;
@@ -99,14 +97,14 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
       std::string imageRef;
       for (const char* pattern : {"xlink:href=\"", "src=\""}) {
         auto pos = coverPageHtml.find(pattern);
-        while (pos != std::string::npos) {
+        while (pos != std::string_view::npos) {
           pos += strlen(pattern);
           const auto endPos = coverPageHtml.find('"', pos);
-          if (endPos != std::string::npos) {
-            const auto ref = std::string_view{coverPageHtml}.substr(pos, endPos - pos);
+          if (endPos != std::string_view::npos) {
+            const auto ref = coverPageHtml.substr(pos, endPos - pos);
             // Check if it's an image file
             if (FsHelpers::hasPngExtension(ref) || FsHelpers::hasJpgExtension(ref) || FsHelpers::hasGifExtension(ref)) {
-              imageRef = ref;
+              imageRef = std::string(ref);
               break;
             }
           }
@@ -169,25 +167,18 @@ bool Epub::parseTocNcxFile() const {
     return false;
   }
 
-  const auto ncxBuffer = static_cast<uint8_t*>(malloc(1024));
-  if (!ncxBuffer) {
-    LOG_ERR("EBP", "Could not allocate memory for toc ncx parser");
-    return false;
-  }
+  std::vector<uint8_t> ncxBuffer(1024);
 
   while (tempNcxFile.available()) {
-    const auto readSize = tempNcxFile.read(ncxBuffer, 1024);
+    const auto readSize = tempNcxFile.read(ncxBuffer.data(), 1024);
     if (readSize == 0) break;
-    const auto processedSize = ncxParser.write(ncxBuffer, readSize);
+    const auto processedSize = ncxParser.write(ncxBuffer.data(), readSize);
 
     if (processedSize != readSize) {
       LOG_ERR("EBP", "Could not process all toc ncx data");
-      free(ncxBuffer);
       return false;
     }
   }
-
-  free(ncxBuffer);
   // Explicitly close() file before calling Storage.remove()
   tempNcxFile.close();
   Storage.remove(tmpNcxPath.c_str());
@@ -228,24 +219,17 @@ bool Epub::parseTocNavFile() const {
     return false;
   }
 
-  const auto navBuffer = static_cast<uint8_t*>(malloc(1024));
-  if (!navBuffer) {
-    LOG_ERR("EBP", "Could not allocate memory for toc nav parser");
-    return false;
-  }
+  std::vector<uint8_t> navBuffer(1024);
 
   while (tempNavFile.available()) {
-    const auto readSize = tempNavFile.read(navBuffer, 1024);
-    const auto processedSize = navParser.write(navBuffer, readSize);
+    const auto readSize = tempNavFile.read(navBuffer.data(), 1024);
+    const auto processedSize = navParser.write(navBuffer.data(), readSize);
 
     if (processedSize != readSize) {
       LOG_ERR("EBP", "Could not process all toc nav data");
-      free(navBuffer);
       return false;
     }
   }
-
-  free(navBuffer);
   // Explicitly close() file before calling Storage.remove()
   tempNavFile.close();
   Storage.remove(tmpNavPath.c_str());
@@ -338,9 +322,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   LOG_DBG("EBP", "Loading ePub: %s", filepath.c_str());
 
   // Initialize spine/TOC cache
-  bookMetadataCache.reset(new BookMetadataCache(cachePath));
+  bookMetadataCache = std::make_unique<BookMetadataCache>(cachePath);
   // Always create CssParser - needed for inline style parsing even without CSS files
-  cssParser.reset(new CssParser(cachePath));
+  cssParser = std::make_unique<CssParser>(cachePath);
 
   // Try to load existing cache first
   if (bookMetadataCache->load()) {
@@ -449,7 +433,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   }
 
   // Reload the cache from disk so it's in the correct state
-  bookMetadataCache.reset(new BookMetadataCache(cachePath));
+  bookMetadataCache = std::make_unique<BookMetadataCache>(cachePath);
   if (!bookMetadataCache->load()) {
     LOG_ERR("EBP", "Failed to reload cache after writing");
     return false;
@@ -712,35 +696,35 @@ bool Epub::generateThumbBmp(int height) const {
   return false;
 }
 
-uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size, const bool trailingNullByte) const {
+std::vector<uint8_t> Epub::readItemContentsToBytes(std::string_view itemHref, const bool trailingNullByte) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
-    return nullptr;
+    return {};
   }
 
-  const std::string path = FsHelpers::normalisePath(itemHref);
+  const std::string path = FsHelpers::normalisePath(std::string(itemHref));
 
-  const auto content = ZipFile(filepath).readFileToMemory(path.c_str(), size, trailingNullByte);
-  if (!content) {
+  auto content = ZipFile(filepath).readFileToMemory(path.c_str(), trailingNullByte);
+  if (content.empty()) {
     LOG_DBG("EBP", "Failed to read item %s", path.c_str());
-    return nullptr;
+    return {};
   }
 
   return content;
 }
 
-bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, const size_t chunkSize) const {
+bool Epub::readItemContentsToStream(std::string_view itemHref, Print& out, const size_t chunkSize) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
     return false;
   }
 
-  const std::string path = FsHelpers::normalisePath(itemHref);
+  const std::string path = FsHelpers::normalisePath(std::string(itemHref));
   return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize);
 }
 
-bool Epub::getItemSize(const std::string& itemHref, size_t* size) const {
-  const std::string path = FsHelpers::normalisePath(itemHref);
+bool Epub::getItemSize(std::string_view itemHref, size_t* size) const {
+  const std::string path = FsHelpers::normalisePath(std::string(itemHref));
   return ZipFile(filepath).getInflatedFileSize(path.c_str(), size);
 }
 
@@ -860,28 +844,31 @@ float Epub::calculateProgress(const int currentSpineIndex, const float currentSp
   return totalProgress / static_cast<float>(bookSize);
 }
 
-int Epub::resolveHrefToSpineIndex(const std::string& href) const {
+int Epub::resolveHrefToSpineIndex(std::string_view href) const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) return -1;
 
   // Extract filename (remove #anchor)
-  std::string target = href;
+  std::string_view target = href;
   size_t hashPos = target.find('#');
-  if (hashPos != std::string::npos) target = target.substr(0, hashPos);
+  if (hashPos != std::string_view::npos) target = target.substr(0, hashPos);
 
   // Same-file reference (anchor-only)
   if (target.empty()) return -1;
 
-  // Extract just the filename for comparison
+  // 1. Fast path: use the index in BookMetadataCache
+  int index = bookMetadataCache->getSpineIndexForHref(target);
+  if (index != -1) return index;
+
+  // 2. Fallback: filename-only match (slower, but handles some edge cases)
   size_t targetSlash = target.find_last_of('/');
-  std::string targetFilename = (targetSlash != std::string::npos) ? target.substr(targetSlash + 1) : target;
+  std::string_view targetFilename = (targetSlash != std::string_view::npos) ? target.substr(targetSlash + 1) : target;
 
   for (int i = 0; i < getSpineItemsCount(); i++) {
     const auto& spineHref = getSpineItem(i).href;
-    // Try exact match first
-    if (spineHref == target) return i;
     // Then filename-only match
     size_t spineSlash = spineHref.find_last_of('/');
-    std::string spineFilename = (spineSlash != std::string::npos) ? spineHref.substr(spineSlash + 1) : spineHref;
+    std::string_view spineFilename =
+        (spineSlash != std::string::npos) ? std::string_view(spineHref).substr(spineSlash + 1) : std::string_view(spineHref);
     if (spineFilename == targetFilename) return i;
   }
   return -1;

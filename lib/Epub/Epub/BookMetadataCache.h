@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <deque>
 #include <string>
+#include <string_view>
 
 class BookMetadataCache {
  public:
@@ -67,7 +68,7 @@ class BookMetadataCache {
   static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
 
   // FNV-1a 64-bit hash function
-  static uint64_t fnvHash64(const std::string& s) {
+  static uint64_t fnvHash64(std::string_view s) {
     uint64_t hash = 14695981039346656037ull;
     for (char c : s) {
       hash ^= static_cast<uint8_t>(c);
@@ -91,20 +92,21 @@ class BookMetadataCache {
   // Building phase (stream to disk immediately)
   bool beginWrite();
   bool beginContentOpfPass();
-  void createSpineEntry(const std::string& href);
+  void createSpineEntry(std::string_view href);
   bool endContentOpfPass();
   bool beginTocPass();
-  void createTocEntry(const std::string& title, const std::string& href, const std::string& anchor, uint8_t level);
+  void createTocEntry(std::string_view title, std::string_view href, std::string_view anchor, uint8_t level);
   bool endTocPass();
   bool endWrite();
   bool cleanupTmpFiles() const;
 
   // Post-processing to update mappings and sizes
-  bool buildBookBin(const std::string& epubPath, const BookMetadata& metadata);
+  bool buildBookBin(std::string_view epubPath, const BookMetadata& metadata);
 
   // Reading phase (read mode)
   bool load();
   SpineEntry getSpineEntry(int index);
+  int16_t getSpineIndexForHref(std::string_view href) const;
   TocEntry getTocEntry(int index);
   int getSpineCount() const { return spineCount; }
   int getTocCount() const { return tocCount; }

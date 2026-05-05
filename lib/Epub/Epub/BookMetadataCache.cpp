@@ -99,7 +99,7 @@ bool BookMetadataCache::endWrite() {
   return true;
 }
 
-bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMetadata& metadata) {
+bool BookMetadataCache::buildBookBin(std::string_view epubPath, const BookMetadata& metadata) {
   // Open all three files, writing to meta, reading from spine and toc
   if (!Storage.openFileForWrite("BMC", cachePath + bookBinFile, bookFile)) {
     return false;
@@ -169,7 +169,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     }
   }
 
-  ZipFile zip(epubPath);
+  ZipFile zip(std::string{epubPath});
   // Pre-open zip file to speed up size calculations
   if (!zip.open()) {
     LOG_ERR("BMC", "Could not open EPUB zip for size calculations");
@@ -312,18 +312,18 @@ uint32_t BookMetadataCache::writeTocEntry(FsFile& file, const TocEntry& entry) c
 
 // Note: for the LUT to be accurate, this **MUST** be called for all spine items before `addTocEntry` is ever called
 // this is because in this function we're marking positions of the items
-void BookMetadataCache::createSpineEntry(const std::string& href) {
+void BookMetadataCache::createSpineEntry(std::string_view href) {
   if (!buildMode || !spineFile) {
     LOG_DBG("BMC", "createSpineEntry called but not in build mode");
     return;
   }
 
-  const SpineEntry entry(href, 0, -1);
+  const SpineEntry entry(std::string(href), 0, -1);
   writeSpineEntry(spineFile, entry);
   spineCount++;
 }
 
-void BookMetadataCache::createTocEntry(const std::string& title, const std::string& href, const std::string& anchor,
+void BookMetadataCache::createTocEntry(std::string_view title, std::string_view href, std::string_view anchor,
                                        const uint8_t level) {
   if (!buildMode || !tocFile || !spineFile) {
     LOG_DBG("BMC", "createTocEntry called but not in build mode");
@@ -348,7 +348,8 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
     }
 
     if (spineIndex == -1) {
-      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %s", href.c_str());
+      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %.*s", static_cast<int>(href.size()),
+              href.data());
     }
   } else {
     spineFile.seek(0);
@@ -360,11 +361,12 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
       }
     }
     if (spineIndex == -1) {
-      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %s", href.c_str());
+      LOG_DBG("BMC", "createTocEntry: Could not find spine item for TOC href %.*s", static_cast<int>(href.size()),
+              href.data());
     }
   }
 
-  const TocEntry entry(title, href, anchor, level, spineIndex);
+  const TocEntry entry(std::string(title), std::string(href), std::string(anchor), level, spineIndex);
   writeTocEntry(tocFile, entry);
   tocCount++;
 }
@@ -395,9 +397,51 @@ bool BookMetadataCache::load() {
   serialization::readString(bookFile, coreMetadata.coverItemHref);
   serialization::readString(bookFile, coreMetadata.textReferenceHref);
 
+  // Populate spine hash index for fast lookup if the book is non-trivial
+  if (spineCount > 0) {
+    spineHrefIndex.clear();
+    for (int i = 0; i < spineCount; i++) {
+      // Seek to spine LUT item
+      bookFile.seek(lutOffset + sizeof(uint32_t) * i);
+      uint32_t spineEntryPos;
+      serialization::readPod(bookFile, spineEntryPos);
+      bookFile.seek(spineEntryPos);
+      
+      // We only need the href for the index
+      std::string href;
+      serialization::readString(bookFile, href);
+      
+      spineHrefIndex.push_back({fnvHash64(href), static_cast<uint16_t>(href.length()), static_cast<int16_t>(i)});
+    }
+
+    std::sort(spineHrefIndex.begin(), spineHrefIndex.end(),
+              [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
+                return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
+              });
+    useSpineHrefIndex = true;
+  }
+
   loaded = true;
   LOG_DBG("BMC", "Loaded cache data: %d spine, %d TOC entries", spineCount, tocCount);
   return true;
+}
+
+int16_t BookMetadataCache::getSpineIndexForHref(std::string_view href) const {
+  if (!loaded || !useSpineHrefIndex) return -1;
+
+  uint64_t targetHash = fnvHash64(href);
+  uint16_t targetLen = static_cast<uint16_t>(href.size());
+
+  auto it = std::lower_bound(spineHrefIndex.begin(), spineHrefIndex.end(), SpineHrefIndexEntry{targetHash, targetLen, 0},
+                             [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
+                               return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
+                             });
+
+  if (it != spineHrefIndex.end() && it->hrefHash == targetHash && it->hrefLen == targetLen) {
+    return it->spineIndex;
+  }
+
+  return -1;
 }
 
 BookMetadataCache::SpineEntry BookMetadataCache::getSpineEntry(const int index) {
