@@ -6,7 +6,7 @@
 
 namespace FsHelpers {
 
-std::string normalisePath(const std::string& path) {
+std::string normalisePath(std::string_view path) {
   std::vector<std::string> components;
   std::string component;
 
@@ -78,12 +78,12 @@ bool hasTxtExtension(std::string_view fileName) { return checkFileExtension(file
 
 bool hasMarkdownExtension(std::string_view fileName) { return checkFileExtension(fileName, ".md"); }
 
-std::string extractFolderPath(const std::string& filePath) {
+std::string extractFolderPath(std::string_view filePath) {
   const auto lastSlash = filePath.find_last_of('/');
-  if (lastSlash == std::string::npos || lastSlash == 0) {
+  if (lastSlash == std::string_view::npos || lastSlash == 0) {
     return "/";
   }
-  return filePath.substr(0, lastSlash);
+  return std::string(filePath.substr(0, lastSlash));
 }
 
 void sanitizePathComponentForFat32(const char* input, char* output, size_t maxLen) {

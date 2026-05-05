@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class LanguageHyphenator;
@@ -33,10 +34,10 @@ class Hyphenator {
   //   4. Fallback every-N-chars splitting (only when includeFallback is true AND no
   //      pattern breaks were found). Used as a last resort to prevent a single oversized
   //      word from overflowing the page width.
-  static std::vector<BreakInfo> breakOffsets(const std::string& word, bool includeFallback);
+  static std::vector<BreakInfo> breakOffsets(std::string_view word, bool includeFallback);
 
   // Provide a publication-level language hint (e.g. "en", "en-US", "ru") used to select hyphenation rules.
-  static void setPreferredLanguage(const std::string& lang);
+  static void setPreferredLanguage(std::string_view lang);
 
  private:
   static const LanguageHyphenator* cachedHyphenator_;

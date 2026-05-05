@@ -18,13 +18,16 @@ const char* I18n::get(StrId id) const {
     return "???";
   }
 
-  // Use generated helper function - no hardcoded switch needed!
-  const LangStrings lang = getLanguageStrings(_language);
-
+  const uint16_t off = _offsets[index];
   // If bit 15 of the offset is set, apply the offset to the English lookup table
-  const uint16_t off = lang.offsets[index];
   if (off & 0x8000) return STRINGS_EN_DATA + (off & 0x7FFF);
-  return lang.data + off;
+  return _data + off;
+}
+
+void I18n::updateCache() {
+  const LangStrings lang = getLanguageStrings(_language);
+  _offsets = lang.offsets;
+  _data = lang.data;
 }
 
 void I18n::setLanguage(Language lang) {
@@ -32,6 +35,7 @@ void I18n::setLanguage(Language lang) {
     return;
   }
   _language = lang;
+  updateCache();
 }
 
 const char* I18n::getLanguageName(Language lang) const {

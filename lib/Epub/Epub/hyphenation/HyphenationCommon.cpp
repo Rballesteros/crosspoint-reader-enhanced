@@ -179,15 +179,15 @@ void trimSurroundingPunctuationAndFootnote(std::vector<CodepointInfo>& cps) {
   }
 }
 
-std::vector<CodepointInfo> collectCodepoints(const std::string& word) {
+std::vector<CodepointInfo> collectCodepoints(std::string_view word) {
   std::vector<CodepointInfo> cps;
   cps.reserve(word.size());
 
-  const unsigned char* base = reinterpret_cast<const unsigned char*>(word.c_str());
-  const unsigned char* ptr = base;
-  while (*ptr != 0) {
-    const unsigned char* current = ptr;
-    const uint32_t cp = utf8NextCodepoint(&ptr);
+  const unsigned char* base = reinterpret_cast<const unsigned char*>(word.data());
+  std::string_view sv = word;
+  while (!sv.empty()) {
+    const unsigned char* current = reinterpret_cast<const unsigned char*>(sv.data());
+    const uint32_t cp = utf8NextCodepoint(sv);
     // If this is a combining diacritic (e.g., U+0301 = acute) and there's
     // a previous base character that can be composed into a single
     // precomposed Unicode scalar (Latin-1 / Latin-Extended), do that

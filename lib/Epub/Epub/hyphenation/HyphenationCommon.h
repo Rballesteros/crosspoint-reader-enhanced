@@ -23,4 +23,4 @@ bool isApostrophe(uint32_t cp);
 bool isExplicitHyphen(uint32_t cp);
 bool isSoftHyphen(uint32_t cp);
 void trimSurroundingPunctuationAndFootnote(std::vector<CodepointInfo>& cps);
-std::vector<CodepointInfo> collectCodepoints(const std::string& word);
+std::vector<CodepointInfo> collectCodepoints(std::string_view word);

@@ -56,6 +56,55 @@ uint32_t utf8NextCodepoint(const unsigned char** string) {
   return cp;
 }
 
+uint32_t utf8NextCodepoint(std::string_view& sv) {
+  if (sv.empty()) {
+    return 0;
+  }
+
+  const unsigned char lead = static_cast<unsigned char>(sv[0]);
+  const int bytes = utf8CodepointLen(lead);
+
+  // Invalid lead byte
+  if (bytes == 1 && lead >= 0x80) {
+    sv.remove_prefix(1);
+    return REPLACEMENT_GLYPH;
+  }
+
+  if (bytes == 1) {
+    sv.remove_prefix(1);
+    return lead;
+  }
+
+  // Check if we have enough bytes
+  if (sv.size() < static_cast<size_t>(bytes)) {
+    sv.remove_prefix(sv.size());
+    return REPLACEMENT_GLYPH;
+  }
+
+  // Validate continuation bytes
+  for (int i = 1; i < bytes; i++) {
+    if ((static_cast<unsigned char>(sv[i]) & 0xC0) != 0x80) {
+      sv.remove_prefix(i);
+      return REPLACEMENT_GLYPH;
+    }
+  }
+
+  uint32_t cp = lead & ((1 << (7 - bytes)) - 1);
+  for (int i = 1; i < bytes; i++) {
+    cp = (cp << 6) | (static_cast<unsigned char>(sv[i]) & 0x3F);
+  }
+
+  const bool overlong = (bytes == 2 && cp < 0x80) || (bytes == 3 && cp < 0x800) || (bytes == 4 && cp < 0x10000);
+  const bool surrogate = (cp >= 0xD800 && cp <= 0xDFFF);
+  if (overlong || surrogate || cp > 0x10FFFF) {
+    sv.remove_prefix(1);
+    return REPLACEMENT_GLYPH;
+  }
+
+  sv.remove_prefix(bytes);
+  return cp;
+}
+
 int utf8SafeTruncateBuffer(const char* buf, int len) {
   if (len <= 0) return 0;
 

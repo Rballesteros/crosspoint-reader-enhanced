@@ -30,9 +30,13 @@ class I18n {
   static const char* getCharacterSet(Language lang);
 
  private:
-  I18n() : _language(Language::EN) {}
+  I18n() : _language(Language::EN) { updateCache(); }
+
+  void updateCache();
 
   Language _language;
+  const uint16_t* _offsets = nullptr;
+  const char* _data = nullptr;
 };
 
 // Convenience macros

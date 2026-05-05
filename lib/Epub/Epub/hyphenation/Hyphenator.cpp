@@ -26,7 +26,7 @@ static constexpr Iso639Mapping kIso639Mappings[] = {
 };
 
 // Maps a BCP-47 or ISO 639-2 language tag to a language-specific hyphenator.
-const LanguageHyphenator* hyphenatorForLanguage(const std::string& langTag) {
+const LanguageHyphenator* hyphenatorForLanguage(std::string_view langTag) {
   if (langTag.empty()) return nullptr;
 
   // Extract primary subtag and normalize to lowercase (e.g., "en-US" -> "en", "ENG" -> "en").
@@ -171,7 +171,7 @@ void sortAndDedupeBreakInfos(std::vector<Hyphenator::BreakInfo>& infos) {
 
 }  // namespace
 
-std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(const std::string& word, const bool includeFallback) {
+std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(std::string_view word, const bool includeFallback) {
   if (word.empty()) {
     return {};
   }
@@ -262,4 +262,4 @@ std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(const std::string& w
   return breaks;
 }
 
-void Hyphenator::setPreferredLanguage(const std::string& lang) { cachedHyphenator_ = hyphenatorForLanguage(lang); }
+void Hyphenator::setPreferredLanguage(std::string_view lang) { cachedHyphenator_ = hyphenatorForLanguage(lang); }
