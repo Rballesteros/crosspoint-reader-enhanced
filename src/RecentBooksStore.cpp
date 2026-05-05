@@ -22,6 +22,12 @@ RecentBooksStore RecentBooksStore::instance;
 
 void RecentBooksStore::addBook(const std::string& path, const std::string& title, const std::string& author,
                                const std::string& coverBmpPath) {
+  // Check if first entry is already this book with the same metadata
+  if (!recentBooks.empty() && recentBooks[0].path == path && recentBooks[0].title == title &&
+      recentBooks[0].author == author && recentBooks[0].coverBmpPath == coverBmpPath) {
+    return;
+  }
+
   // Remove existing entry if present
   auto it =
       std::find_if(recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) { return book.path == path; });
@@ -46,6 +52,9 @@ void RecentBooksStore::updateBook(const std::string& path, const std::string& ti
       std::find_if(recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) { return book.path == path; });
   if (it != recentBooks.end()) {
     RecentBook& book = *it;
+    if (book.title == title && book.author == author && book.coverBmpPath == coverBmpPath) {
+      return;  // No metadata changes
+    }
     book.title = title;
     book.author = author;
     book.coverBmpPath = coverBmpPath;

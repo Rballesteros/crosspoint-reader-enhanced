@@ -80,8 +80,22 @@ void CrossPointSettings::validateFrontButtonMapping(CrossPointSettings& settings
 }
 
 bool CrossPointSettings::saveToFile() const {
+  static CrossPointSettings lastSavedState;
+  static bool hasSavedState = false;
+
+  // Don't save if nothing has changed
+  if (hasSavedState && *this == lastSavedState) {
+    LOG_DBG("CPS", "Settings unchanged, skipping NVS write");
+    return true;
+  }
+
   Storage.mkdir("/.crosspoint");
-  return JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON);
+  if (JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON)) {
+    lastSavedState = *this;
+    hasSavedState = true;
+    return true;
+  }
+  return false;
 }
 
 bool CrossPointSettings::loadFromFile() {

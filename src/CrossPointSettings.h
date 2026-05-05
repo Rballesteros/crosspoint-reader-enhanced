@@ -13,9 +13,9 @@ class CrossPointSettings {
   static CrossPointSettings instance;
 
  public:
-  // Delete copy constructor and assignment
-  CrossPointSettings(const CrossPointSettings&) = delete;
-  CrossPointSettings& operator=(const CrossPointSettings&) = delete;
+  // Default copy constructor and assignment
+  CrossPointSettings(const CrossPointSettings&) = default;
+  CrossPointSettings& operator=(const CrossPointSettings&) = default;
 
   enum SLEEP_SCREEN_MODE {
     DARK = 0,
@@ -246,6 +246,55 @@ class CrossPointSettings {
   float getReaderLineCompression() const;
   unsigned long getSleepTimeoutMs() const;
   int getRefreshFrequency() const;
+
+  bool operator==(const CrossPointSettings& other) const {
+    return sleepScreen == other.sleepScreen &&
+           sleepScreenCoverMode == other.sleepScreenCoverMode &&
+           sleepScreenCoverFilter == other.sleepScreenCoverFilter &&
+           statusBar == other.statusBar &&
+           statusBarChapterPageCount == other.statusBarChapterPageCount &&
+           statusBarBookProgressPercentage == other.statusBarBookProgressPercentage &&
+           statusBarProgressBar == other.statusBarProgressBar &&
+           statusBarProgressBarThickness == other.statusBarProgressBarThickness &&
+           statusBarTitle == other.statusBarTitle &&
+           statusBarBattery == other.statusBarBattery &&
+           extraParagraphSpacing == other.extraParagraphSpacing &&
+           textAntiAliasing == other.textAntiAliasing &&
+           shortPwrBtn == other.shortPwrBtn &&
+           orientation == other.orientation &&
+           frontButtonLayout == other.frontButtonLayout &&
+           sideButtonLayout == other.sideButtonLayout &&
+           frontButtonBack == other.frontButtonBack &&
+           frontButtonConfirm == other.frontButtonConfirm &&
+           frontButtonLeft == other.frontButtonLeft &&
+           frontButtonRight == other.frontButtonRight &&
+           fontFamily == other.fontFamily &&
+           fontSize == other.fontSize &&
+           lineSpacing == other.lineSpacing &&
+           paragraphAlignment == other.paragraphAlignment &&
+           sleepTimeout == other.sleepTimeout &&
+           refreshFrequency == other.refreshFrequency &&
+           hyphenationEnabled == other.hyphenationEnabled &&
+           screenMargin == other.screenMargin &&
+           strcmp(opdsServerUrl, other.opdsServerUrl) == 0 &&
+           strcmp(opdsUsername, other.opdsUsername) == 0 &&
+           strcmp(opdsPassword, other.opdsPassword) == 0 &&
+           hideBatteryPercentage == other.hideBatteryPercentage &&
+           longPressButtonBehavior == other.longPressButtonBehavior &&
+           uiTheme == other.uiTheme &&
+           fadingFix == other.fadingFix &&
+           embeddedStyle == other.embeddedStyle &&
+           showHiddenFiles == other.showHiddenFiles &&
+           bluetoothEnabled == other.bluetoothEnabled &&
+           strcmp(bleBondedDeviceAddr, other.bleBondedDeviceAddr) == 0 &&
+           strcmp(bleBondedDeviceName, other.bleBondedDeviceName) == 0 &&
+           bleBondedDeviceAddrType == other.bleBondedDeviceAddrType &&
+           imageRendering == other.imageRendering &&
+           tiltPageTurn == other.tiltPageTurn &&
+           language == other.language;
+  }
+
+  bool operator!=(const CrossPointSettings& other) const { return !(*this == other); }
 };
 
 // Helper macro to access settings
