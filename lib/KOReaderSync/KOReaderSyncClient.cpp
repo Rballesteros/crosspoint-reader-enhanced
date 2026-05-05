@@ -24,33 +24,14 @@ constexpr int HTTP_BUF_SIZE = 2048;
 
 // Response buffer for reading HTTP body
 struct ResponseBuffer {
-  char* data = nullptr;
-  int len = 0;
-  int capacity = 0;
-
-  ~ResponseBuffer() { free(data); }
-
-  bool ensure(int size) {
-    if (size <= capacity) return true;
-    char* newData = (char*)realloc(data, size);
-    if (!newData) return false;
-    data = newData;
-    capacity = size;
-    return true;
-  }
+  std::string data;
 };
 
 // HTTP event handler to collect response body
 esp_err_t httpEventHandler(esp_http_client_event_t* evt) {
   auto* buf = static_cast<ResponseBuffer*>(evt->user_data);
   if (evt->event_id == HTTP_EVENT_ON_DATA && buf) {
-    if (buf->ensure(buf->len + evt->data_len + 1)) {
-      memcpy(buf->data + buf->len, evt->data, evt->data_len);
-      buf->len += evt->data_len;
-      buf->data[buf->len] = '\0';
-    } else {
-      LOG_ERR("KOSync", "Response buffer allocation failed (%d bytes)", evt->data_len);
-    }
+    buf->data.append(static_cast<const char*>(evt->data), evt->data_len);
   }
   return ESP_OK;
 }
@@ -121,7 +102,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
   return SERVER_ERROR;
 }
 
-KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& documentHash,
+KOReaderSyncClient::Error KOReaderSyncClient::getProgress(std::string_view documentHash,
                                                           KOReaderProgress& outProgress) {
   lastHttpCode = 0;
   if (!KOREADER_STORE.hasCredentials()) {
@@ -129,7 +110,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
     return NO_CREDENTIALS;
   }
 
-  std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash;
+  std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + std::string(documentHash);
   LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
 
   ResponseBuffer buf;
@@ -145,7 +126,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
 
   if (err != ESP_OK) return NETWORK_ERROR;
 
-  if (httpCode == 200 && buf.data) {
+  if (httpCode == 200 && !buf.data.empty()) {
     JsonDocument doc;
     const DeserializationError error = deserializeJson(doc, buf.data);
 
@@ -154,7 +135,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
       return JSON_ERROR;
     }
 
-    outProgress.document = documentHash;
+    outProgress.document = std::string(documentHash);
     outProgress.progress = doc["progress"].as<std::string>();
     outProgress.percentage = doc["percentage"].as<float>();
     outProgress.device = doc["device"].as<std::string>();

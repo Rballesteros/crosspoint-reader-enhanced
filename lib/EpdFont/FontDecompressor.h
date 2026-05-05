@@ -2,6 +2,7 @@
 
 #include <InflateReader.h>
 
+#include <string_view>
 #include <vector>
 
 #include "EpdFontData.h"
@@ -27,7 +28,7 @@ class FontDecompressor {
   // Pre-scan UTF-8 text and extract needed glyph bitmaps into a flat page buffer.
   // Each group is decompressed once into a temp buffer; only needed glyphs are kept.
   // Returns the number of glyphs that couldn't be loaded (0 on full success).
-  int prewarmCache(const EpdFontData* fontData, const char* utf8Text);
+  int prewarmCache(const EpdFontData* fontData, std::string_view utf8Text);
 
   struct Stats {
     uint32_t cacheHits = 0;
@@ -57,19 +58,24 @@ class FontDecompressor {
     uint32_t alignedOffset;  // byte-aligned offset within its decompressed group (set during prewarm pre-scan)
   };
   struct PageSlot {
-    uint8_t* buffer = nullptr;
+    std::vector<uint8_t> buffer;
     const EpdFontData* fontData = nullptr;
-    PageGlyphEntry* glyphs = nullptr;
-    uint16_t glyphCount = 0;
+    std::vector<PageGlyphEntry> glyphs;
   };
   PageSlot pageSlots[MAX_PAGE_SLOTS] = {};
   uint8_t pageSlotCount = 0;
 
   // Hot group: last decompressed group (byte-aligned) for non-prewarmed fallback path.
   // Kept in byte-aligned format; individual glyphs are compacted on demand into hotGlyphBuf.
-  const EpdFontData* hotGroupFont = nullptr;
-  uint16_t hotGroupIndex = UINT16_MAX;
-  std::vector<uint8_t> hotGroup;
+  // Hot group: last decompressed groups (byte-aligned) for non-prewarmed fallback path.
+  struct HotGroup {
+    std::vector<uint8_t> data;
+    uint16_t groupIndex = UINT16_MAX;
+    const EpdFontData* fontData = nullptr;
+  };
+  static constexpr uint8_t MAX_HOT_GROUPS = 2;
+  HotGroup hotGroups[MAX_HOT_GROUPS];
+  uint8_t hotGroupMruIdx = 0;
 
   // Scratch buffer for compacting a single glyph from the hot group.
   // Valid until the next getBitmap() call.

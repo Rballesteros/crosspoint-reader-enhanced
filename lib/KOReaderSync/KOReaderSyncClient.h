@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 
 /**
  * Progress data from KOReader sync server.
@@ -43,7 +44,7 @@ class KOReaderSyncClient {
    * @param outProgress Output: the progress data
    * @return OK on success, NOT_FOUND if no progress exists, error code on failure
    */
-  static Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress);
+  static Error getProgress(std::string_view documentHash, KOReaderProgress& outProgress);
 
   /**
    * Update reading progress for a document.

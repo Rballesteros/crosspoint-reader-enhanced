@@ -3,6 +3,7 @@
 #include <uzlib.h>
 
 #include <cstddef>
+#include <vector>
 
 // Return value for readAtMost().
 enum class InflateStatus {
@@ -44,11 +45,10 @@ class InflateReader {
   InflateReader(const InflateReader&) = delete;
   InflateReader& operator=(const InflateReader&) = delete;
 
-  // Initialise decompressor. streaming=true allocates a 32KB ring buffer needed
-  // when read() or readAtMost() will be called multiple times.
+  // Initialise decompressor. streaming=true allocates a ring buffer of dictSize
+  // (defaults to 32KB) needed when read() or readAtMost() will be called multiple times.
   // Returns false only in streaming mode if the ring buffer allocation fails.
-  bool init(bool streaming = false);
-
+  bool init(bool streaming = false, size_t dictSize = 0);
   // Release the ring buffer and reset internal state.
   void deinit();
 
@@ -81,5 +81,5 @@ class InflateReader {
 
  private:
   uzlib_uncomp decomp = {};
-  uint8_t* ringBuffer = nullptr;
+  std::vector<uint8_t> ringBuffer;
 };

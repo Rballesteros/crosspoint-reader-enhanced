@@ -3,7 +3,9 @@
 
 #include <deque>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 class ZipFile {
  public:
@@ -47,7 +49,7 @@ class ZipFile {
   uint32_t lastCentralDirPos = 0;
   bool lastCentralDirPosValid = false;
 
-  bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
+  bool loadFileStatSlim(std::string_view filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
   bool loadZipDetails();
 
@@ -60,13 +62,13 @@ class ZipFile {
   bool open();
   bool close();
   bool loadAllFileStatSlims();
-  bool getInflatedFileSize(const char* filename, size_t* size);
+  bool getInflatedFileSize(std::string_view filename, size_t* size);
   // Batch lookup: scan ZIP central dir once and fill sizes for matching targets.
   // targets must be sorted by (hash, len). sizes[target.index] receives uncompressedSize.
   // Returns number of targets matched.
   int fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes);
   // Due to the memory required to run each of these, it is recommended to not preopen the zip file for multiple
   // These functions will open and close the zip as needed
-  uint8_t* readFileToMemory(const char* filename, size_t* size = nullptr, bool trailingNullByte = false);
-  bool readFileToStream(const char* filename, Print& out, size_t chunkSize);
+  std::vector<uint8_t> readFileToMemory(std::string_view filename, bool trailingNullByte = false);
+  bool readFileToStream(std::string_view filename, Print& out, size_t chunkSize);
 };
