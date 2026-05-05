@@ -37,17 +37,65 @@ This project is **not affiliated with Xteink**; it's built as a community projec
 - [x] Wifi book upload
 - [x] Wifi OTA updates
 - [x] KOReader Sync integration for cross-device reading progress
+- [x] Bluetooth LE HID page-turn remote support
+  - [x] Scan, connect, and auto-reconnect to page-turn remotes
+  - [x] Learn previous/next key mappings for remotes with non-standard reports
+  - [x] Optional confirm/back key learning for multi-button remotes
 - [x] Configurable font, layout, and display options
   - [ ] User provided fonts
   - [ ] Full UTF support
 - [x] Screen rotation
+- [x] XTC/XTCH reader memory improvements with streaming page rendering
+- [x] Low-memory rendering safeguards for EPUB images, XTC thumbnails, and anti-aliased text
 
 Multi-language support: Read EPUBs in various languages, including English, Spanish, French, German, Italian, Portuguese, Russian, Ukrainian, Polish, Swedish, Norwegian, [and more](./USER_GUIDE.md#supported-languages).
 
 See [the user guide](./USER_GUIDE.md) for instructions on operating CrossPoint, including the
 [KOReader Sync quick setup](./USER_GUIDE.md#365-koreader-sync-quick-setup).
 
+For a detailed summary of this branch compared to `master`, see [docs/branch-changes.md](./docs/branch-changes.md).
+
 For more details about the scope of the project, see the [SCOPE.md](SCOPE.md) document.
+
+### Bluetooth page turners
+
+Bluetooth LE HID remotes can be configured from **Settings > System > Bluetooth**. EPUB readers also include a
+Bluetooth entry in the reader menu so a remote can be connected without leaving the book flow.
+
+The Bluetooth setup screen supports scanning, HID-device filtering, connecting, key learning, key testing, and a debug
+monitor for inspecting incoming HID reports. Bonded remote details are saved in settings and reused for reconnects.
+
+Bluetooth uses additional RAM on the ESP32-C3. When memory is tight, the reader now prefers safe fallbacks, such as
+skipping the anti-aliased text pass instead of failing the page render.
+
+### Improvements in this branch
+
+- Bluetooth LE HID page-turner support using NimBLE.
+- Bluetooth settings screen for enabling Bluetooth, scanning, filtering HID devices, connecting, learning keys, testing mappings, and debugging reports.
+- Persistent bonded remote settings for reconnecting to the last paired remote.
+- Known-device handling for common page-turn remotes, plus custom learned mappings for non-standard devices.
+- Virtual button injection so Bluetooth remotes work through the same input path as the physical buttons.
+- Bluetooth-aware reader page turns that avoid accidental chapter skips from delayed remote release events.
+- Bluetooth activity tracking to reduce unwanted autosleep while a remote is in use.
+- Bluetooth shutdown before deep sleep to keep the power path predictable.
+- Reader menu shortcut for opening Bluetooth settings directly from an EPUB.
+- Serial Bluetooth debug commands for scan, connect, and HID report troubleshooting.
+- EPUB first-open behavior now preserves spine order instead of jumping directly to the OPF text reference.
+- EPUB section builds clear font cache before retrying memory-heavy cache work.
+- EPUB image extraction retries with smaller chunks and dimension probing retries for more reliable image handling.
+- Low-heap CSS fallback to avoid spending memory on embedded styles when heap is already constrained.
+- Anti-aliased text rendering safely skips the grayscale pass if the BW scratch buffer cannot be allocated.
+- Status bar counter partial refresh for faster Bluetooth-driven page turns.
+- TXT reader buffer handling moved from manual allocation to `std::vector`.
+- XTC 1-bit page rendering streams from storage instead of allocating a full page buffer.
+- XTCH 2-bit grayscale rendering streams plane data in passes to reduce peak heap usage.
+- XTC cover and thumbnail generation use lower-memory paths and low-heap thumbnail caps.
+- XTC progress cache now stores total page count alongside current page.
+- Rendering improvements include faster horizontal/vertical lines, partial display-window refresh, vector-managed BW buffer chunks, and improved gray dithering.
+- Font decompression uses safer buffer ownership and a small hot-group cache.
+- ZIP, EPUB, UTF-8, font, and rendering APIs use more `std::string_view` and RAII containers to reduce unnecessary allocation and manual memory management.
+- Development version strings now use `base-version-dev-shortsha` without embedding the branch name.
+- Branch documentation now summarizes the full diff against `master` in [docs/branch-changes.md](./docs/branch-changes.md).
 
 ## Installing
 
@@ -136,6 +184,17 @@ python3 scripts/debugging_monitor.py
 python3 scripts/debugging_monitor.py /dev/cu.usbmodem2101
 ```
 Minor adjustments may be required for Windows.
+
+Bluetooth debug commands are also available from the serial monitor:
+
+```text
+BTDEBUG:ON
+BTDEBUG:OFF
+BTSCAN
+BTSCAN:<milliseconds>
+BTCONNECT:<address>
+BTCONNECT:<address>,<addrType>
+```
 
 ## Internals
 
