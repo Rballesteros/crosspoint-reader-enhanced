@@ -40,7 +40,7 @@ class GfxRenderer {
   uint16_t panelHeight = HalDisplay::DISPLAY_HEIGHT;
   uint16_t panelWidthBytes = HalDisplay::DISPLAY_WIDTH_BYTES;
   uint32_t frameBufferSize = HalDisplay::BUFFER_SIZE;
-  std::vector<uint8_t*> bwBufferChunks;
+  std::vector<std::vector<uint8_t>> bwBufferChunks;
   std::map<int, EpdFontFamily> fontMap;
 
   // Mutable because drawText() is const but needs to delegate scan-mode
@@ -102,6 +102,11 @@ class GfxRenderer {
                        bool roundTopRight, bool roundBottomLeft, bool roundBottomRight, bool state) const;
   void maskRoundedRectOutsideCorners(int x, int y, int width, int height, int radius, Color color = Color::White) const;
   void fillRect(int x, int y, int width, int height, bool state = true) const;
+
+  // Optimized line drawing helpers
+  void drawFastHLine(int x, int y, int width, bool state) const;
+  void drawFastVLine(int x, int y, int height, bool state) const;
+
   void fillRectDither(int x, int y, int width, int height, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
@@ -114,10 +119,10 @@ class GfxRenderer {
   void fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state = true) const;
 
   // Text
-  int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
-  void drawCenteredText(int fontId, int y, const char* text, bool black = true,
+  int getTextWidth(int fontId, std::string_view text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  void drawCenteredText(int fontId, int y, std::string_view text, bool black = true,
                         EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
-  void drawText(int fontId, int x, int y, const char* text, bool black = true,
+  void drawText(int fontId, int x, int y, std::string_view text, bool black = true,
                 EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getSpaceWidth(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   /// Returns the total inter-word advance: fp4::toPixel(spaceAdvance + kern(leftCp,' ') + kern(' ',rightCp)).
@@ -126,19 +131,19 @@ class GfxRenderer {
   int getSpaceAdvance(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style) const;
   /// Returns the kerning adjustment between two adjacent codepoints.
   int getKerning(int fontId, uint32_t leftCp, uint32_t rightCp, EpdFontFamily::Style style) const;
-  int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style) const;
+  int getTextAdvanceX(int fontId, std::string_view text, EpdFontFamily::Style style) const;
   int getFontAscenderSize(int fontId) const;
   int getLineHeight(int fontId) const;
-  std::string truncatedText(int fontId, const char* text, int maxWidth,
+  std::string truncatedText(int fontId, std::string_view text, int maxWidth,
                             EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   /// Word-wrap \p text into at most \p maxLines lines, each no wider than
   /// \p maxWidth pixels. Overflowing words and excess lines are UTF-8-safely
   /// truncated with an ellipsis (U+2026).
-  std::vector<std::string> wrappedText(int fontId, const char* text, int maxWidth, int maxLines,
+  std::vector<std::string> wrappedText(int fontId, std::string_view text, int maxWidth, int maxLines,
                                        EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
 
   // Helper for drawing rotated text (90 degrees clockwise, for side buttons)
-  void drawTextRotated90CW(int fontId, int x, int y, const char* text, bool black = true,
+  void drawTextRotated90CW(int fontId, int x, int y, std::string_view text, bool black = true,
                            EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getTextHeight(int fontId) const;
 

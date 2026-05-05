@@ -3,6 +3,7 @@
 #include <HalStorage.h>
 
 #include <cstdint>
+#include <memory>
 
 #include "BitmapHelpers.h"
 
@@ -94,10 +95,10 @@ class Bitmap {
   uint8_t paletteLum[256] = {};
 
   // Dithering state (mutable for const methods)
-  mutable int16_t* errorCurRow = nullptr;
-  mutable int16_t* errorNextRow = nullptr;
+  mutable std::vector<int16_t> errorCurRow;
+  mutable std::vector<int16_t> errorNextRow;
   mutable int prevRowY = -1;  // Track row progression for error propagation
 
-  mutable AtkinsonDitherer* atkinsonDitherer = nullptr;
-  mutable FloydSteinbergDitherer* fsDitherer = nullptr;
+  mutable std::unique_ptr<AtkinsonDitherer> atkinsonDitherer;
+  mutable std::unique_ptr<FloydSteinbergDitherer> fsDitherer;
 };

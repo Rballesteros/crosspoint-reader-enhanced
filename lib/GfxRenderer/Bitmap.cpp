@@ -13,13 +13,7 @@
 constexpr bool USE_ATKINSON = true;  // Use Atkinson dithering instead of Floyd-Steinberg
 // ============================================================================
 
-Bitmap::~Bitmap() {
-  delete[] errorCurRow;
-  delete[] errorNextRow;
-
-  delete atkinsonDitherer;
-  delete fsDitherer;
-}
+Bitmap::~Bitmap() {}
 
 uint16_t Bitmap::readLE16(FsFile& f) {
   const int c0 = f.read();
@@ -168,9 +162,9 @@ BmpReaderError Bitmap::parseHeaders() {
   const bool highColor = !nativePalette;
   if (highColor && dithering) {
     if (USE_ATKINSON) {
-      atkinsonDitherer = new AtkinsonDitherer(width);
+      atkinsonDitherer = std::make_unique<AtkinsonDitherer>(width);
     } else {
-      fsDitherer = new FloydSteinbergDitherer(width);
+      fsDitherer = std::make_unique<FloydSteinbergDitherer>(width);
     }
   }
 

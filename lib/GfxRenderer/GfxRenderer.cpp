@@ -35,7 +35,8 @@ void GfxRenderer::begin() {
   panelHeight = display.getDisplayHeight();
   panelWidthBytes = display.getDisplayWidthBytes();
   frameBufferSize = display.getBufferSize();
-  bwBufferChunks.assign((frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE, nullptr);
+  const size_t numChunks = (frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
+  bwBufferChunks.reserve(numChunks);
 }
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
@@ -170,8 +171,147 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   }
 }
 
-// IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
-// efficient as possible.
+void GfxRenderer::drawFastHLine(int x, int y, int width, const bool state) const {
+  if (width <= 0 || y < 0 || y >= getScreenHeight()) return;
+  
+  // Clip width to screen
+  if (x < 0) {
+    width += x;
+    x = 0;
+  }
+  if (x + width > getScreenWidth()) {
+    width = getScreenWidth() - x;
+  }
+  if (width <= 0) return;
+
+  // Identify physical orientation
+  int phyX1, phyY1, phyX2, phyY2;
+  rotateCoordinates(orientation, x, y, &phyX1, &phyY1, panelWidth, panelHeight);
+  rotateCoordinates(orientation, x + width - 1, y, &phyX2, &phyY2, panelWidth, panelHeight);
+
+  if (phyY1 == phyY2) {
+    // Physical horizontal line
+    int startX = phyX1, endX = phyX2;
+    if (startX > endX) std::swap(startX, endX);
+
+    const uint32_t rowOffset = static_cast<uint32_t>(phyY1) * panelWidthBytes;
+    
+    // Optimized byte-at-a-time fill
+    int px = startX;
+    
+    // 1. Fill leading pixels until byte alignment
+    while (px <= endX && (px & 7) != 0) {
+      const uint8_t bitMask = (1 << (7 - (px % 8)));
+      if (state) frameBuffer[rowOffset + (px / 8)] &= ~bitMask;
+      else frameBuffer[rowOffset + (px / 8)] |= bitMask;
+      px++;
+    }
+    
+    // 2. Fill full bytes
+    if (px <= endX) {
+      int remainingPixels = (endX - px + 1);
+      int fullBytes = remainingPixels / 8;
+      if (fullBytes > 0) {
+        memset(frameBuffer + rowOffset + (px / 8), state ? 0x00 : 0xFF, fullBytes);
+        px += fullBytes * 8;
+      }
+    }
+    
+    // 3. Fill trailing pixels
+    while (px <= endX) {
+      const uint8_t bitMask = (1 << (7 - (px % 8)));
+      if (state) frameBuffer[rowOffset + (px / 8)] &= ~bitMask;
+      else frameBuffer[rowOffset + (px / 8)] |= bitMask;
+      px++;
+    }
+  } else {
+    // Physical vertical line (due to rotation)
+    int startY = phyY1, endY = phyY2;
+    if (startY > endY) std::swap(startY, endY);
+
+    const int colByteOff = phyX1 / 8;
+    const uint8_t bitMask = (1 << (7 - (phyX1 % 8)));
+    const uint8_t invBitMask = ~bitMask;
+
+    if (state) {
+      for (int py = startY; py <= endY; py++) {
+        frameBuffer[static_cast<uint32_t>(py) * panelWidthBytes + colByteOff] &= invBitMask;
+      }
+    } else {
+      for (int py = startY; py <= endY; py++) {
+        frameBuffer[static_cast<uint32_t>(py) * panelWidthBytes + colByteOff] |= bitMask;
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawFastVLine(int x, int y, int height, const bool state) const {
+  if (height <= 0 || x < 0 || x >= getScreenWidth()) return;
+
+  // Clip height to screen
+  if (y < 0) {
+    height += y;
+    y = 0;
+  }
+  if (y + height > getScreenHeight()) {
+    height = getScreenHeight() - y;
+  }
+  if (height <= 0) return;
+
+  int phyX1, phyY1, phyX2, phyY2;
+  rotateCoordinates(orientation, x, y, &phyX1, &phyY1, panelWidth, panelHeight);
+  rotateCoordinates(orientation, x, y + height - 1, &phyX2, &phyY2, panelWidth, panelHeight);
+
+  if (phyX1 == phyX2) {
+    // Physical vertical line
+    int startY = phyY1, endY = phyY2;
+    if (startY > endY) std::swap(startY, endY);
+
+    const int colByteOff = phyX1 / 8;
+    const uint8_t bitMask = (1 << (7 - (phyX1 % 8)));
+    const uint8_t invBitMask = ~bitMask;
+
+    if (state) {
+      for (int py = startY; py <= endY; py++) {
+        frameBuffer[static_cast<uint32_t>(py) * panelWidthBytes + colByteOff] &= invBitMask;
+      }
+    } else {
+      for (int py = startY; py <= endY; py++) {
+        frameBuffer[static_cast<uint32_t>(py) * panelWidthBytes + colByteOff] |= bitMask;
+      }
+    }
+  } else {
+    // Physical horizontal line
+    int startX = phyX1, endX = phyX2;
+    if (startX > endX) std::swap(startX, endX);
+
+    const uint32_t rowOffset = static_cast<uint32_t>(phyY1) * panelWidthBytes;
+    
+    int px = startX;
+    while (px <= endX && (px & 7) != 0) {
+      const uint8_t bitMask = (1 << (7 - (px % 8)));
+      if (state) frameBuffer[rowOffset + (px / 8)] &= ~bitMask;
+      else frameBuffer[rowOffset + (px / 8)] |= bitMask;
+      px++;
+    }
+    if (px <= endX) {
+      int remainingPixels = (endX - px + 1);
+      int fullBytes = remainingPixels / 8;
+      if (fullBytes > 0) {
+        memset(frameBuffer + rowOffset + (px / 8), state ? 0x00 : 0xFF, fullBytes);
+        px += fullBytes * 8;
+      }
+    }
+    while (px <= endX) {
+      const uint8_t bitMask = (1 << (7 - (px % 8)));
+      if (state) frameBuffer[rowOffset + (px / 8)] &= ~bitMask;
+      else frameBuffer[rowOffset + (px / 8)] |= bitMask;
+      px++;
+    }
+  }
+}
+
+// IMPORTANT: This function is in critical rendering path and is called for every pixel.
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   int phyX = 0;
   int phyY = 0;
@@ -196,7 +336,7 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   }
 }
 
-int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+int GfxRenderer::getTextWidth(const int fontId, std::string_view text, const EpdFontFamily::Style style) const {
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) {
     LOG_ERR("GFX", "Font %d not found", fontId);
@@ -208,13 +348,12 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   return w;
 }
 
-void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* text, const bool black,
-                                   const EpdFontFamily::Style style) const {
+void GfxRenderer::drawCenteredText(const int fontId, const int y, std::string_view text, const bool black,
+                                    const EpdFontFamily::Style style) const {
   const int x = (getScreenWidth() - getTextWidth(fontId, text, style)) / 2;
   drawText(fontId, x, y, text, black, style);
 }
-
-void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
+void GfxRenderer::drawText(const int fontId, const int x, const int y, std::string_view text, const bool black,
                            const EpdFontFamily::Style style) const {
   const int yPos = y + getFontAscenderSize(fontId);
   int lastBaseX = x;
@@ -223,13 +362,13 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
   int lastBaseTop = 0;
   int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
 
-  // cannot draw a NULL / empty string
-  if (text == nullptr || *text == '\0') {
+  // cannot draw an empty string
+  if (text.empty()) {
     return;
   }
 
   if (fontCacheManager_ && fontCacheManager_->isScanning()) {
-    fontCacheManager_->recordText(text, fontId, style);
+    fontCacheManager_->recordText(std::string(text).c_str(), fontId, style);
     return;
   }
 
@@ -242,7 +381,7 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
   uint32_t cp;
   uint32_t prevCp = 0;
-  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+  while ((cp = utf8NextCodepoint(text))) {
     if (utf8IsCombiningMark(cp)) {
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
@@ -278,19 +417,11 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
   if (x1 == x2) {
-    if (y2 < y1) {
-      std::swap(y1, y2);
-    }
-    for (int y = y1; y <= y2; y++) {
-      drawPixel(x1, y, state);
-    }
+    if (y2 < y1) std::swap(y1, y2);
+    drawFastVLine(x1, y1, y2 - y1 + 1, state);
   } else if (y1 == y2) {
-    if (x2 < x1) {
-      std::swap(x1, x2);
-    }
-    for (int x = x1; x <= x2; x++) {
-      drawPixel(x, y1, state);
-    }
+    if (x2 < x1) std::swap(x1, x2);
+    drawFastHLine(x1, y1, x2 - x1 + 1, state);
   } else {
     // Bresenham's line algorithm — integer arithmetic only
     int dx = x2 - x1;
@@ -443,7 +574,7 @@ void GfxRenderer::drawRoundedRect(const int x, const int y, const int width, con
 
 void GfxRenderer::fillRect(const int x, const int y, const int width, const int height, const bool state) const {
   for (int fillY = y; fillY < y + height; fillY++) {
-    drawLine(x, fillY, x + width - 1, fillY, state);
+    drawFastHLine(x, fillY, width, state);
   }
 }
 
@@ -466,12 +597,28 @@ void GfxRenderer::drawPixelDither<Color::White>(const int x, const int y) const 
 
 template <>
 void GfxRenderer::drawPixelDither<Color::LightGray>(const int x, const int y) const {
-  drawPixel(x, y, x % 2 == 0 && y % 2 == 0);
+  // 4x4 Bayer Matrix for ~25-33% density
+  static constexpr uint8_t bayer4x4[4][4] = {
+      {0, 8, 2, 10},
+      {12, 4, 14, 6},
+      {3, 11, 1, 9},
+      {15, 7, 13, 5}
+  };
+  // Threshold 5/16 (~31%)
+  drawPixel(x, y, bayer4x4[y & 3][x & 3] < 5);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::DarkGray>(const int x, const int y) const {
-  drawPixel(x, y, (x + y) % 2 == 0);  // TODO: maybe find a better pattern?
+  // 4x4 Bayer Matrix for ~66-75% density
+  static constexpr uint8_t bayer4x4[4][4] = {
+      {0, 8, 2, 10},
+      {12, 4, 14, 6},
+      {3, 11, 1, 9},
+      {15, 7, 13, 5}
+  };
+  // Threshold 11/16 (~69%)
+  drawPixel(x, y, bayer4x4[y & 3][x & 3] < 11);
 }
 
 void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color) const {
@@ -710,15 +857,8 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
   // Calculate output row size (2 bits per pixel, packed into bytes)
   // IMPORTANT: Use int, not uint8_t, to avoid overflow for images > 1020 pixels wide
   const int outputRowSize = (bitmap.getWidth() + 3) / 4;
-  auto* outputRow = static_cast<uint8_t*>(malloc(outputRowSize));
-  auto* rowBytes = static_cast<uint8_t*>(malloc(bitmap.getRowBytes()));
-
-  if (!outputRow || !rowBytes) {
-    LOG_ERR("GFX", "!! Failed to allocate BMP row buffers");
-    free(outputRow);
-    free(rowBytes);
-    return;
-  }
+  std::vector<uint8_t> outputRow(outputRowSize);
+  std::vector<uint8_t> rowBytes(bitmap.getRowBytes());
 
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
     // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
@@ -732,10 +872,8 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       break;
     }
 
-    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+    if (bitmap.readNextRow(outputRow.data(), rowBytes.data()) != BmpReaderError::Ok) {
       LOG_ERR("GFX", "Failed to read row %d from bitmap", bmpY);
-      free(outputRow);
-      free(rowBytes);
       return;
     }
 
@@ -772,9 +910,6 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       }
     }
   }
-
-  free(outputRow);
-  free(rowBytes);
 }
 
 void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
@@ -792,22 +927,13 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
 
   // For 1-bit BMP, output is still 2-bit packed (for consistency with readNextRow)
   const int outputRowSize = (bitmap.getWidth() + 3) / 4;
-  auto* outputRow = static_cast<uint8_t*>(malloc(outputRowSize));
-  auto* rowBytes = static_cast<uint8_t*>(malloc(bitmap.getRowBytes()));
-
-  if (!outputRow || !rowBytes) {
-    LOG_ERR("GFX", "!! Failed to allocate 1-bit BMP row buffers");
-    free(outputRow);
-    free(rowBytes);
-    return;
-  }
+  std::vector<uint8_t> outputRow(outputRowSize);
+  std::vector<uint8_t> rowBytes(bitmap.getRowBytes());
 
   for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
     // Read rows sequentially using readNextRow
-    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+    if (bitmap.readNextRow(outputRow.data(), rowBytes.data()) != BmpReaderError::Ok) {
       LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
-      free(outputRow);
-      free(rowBytes);
       return;
     }
 
@@ -841,9 +967,6 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
       // White pixels (val == 3) are not drawn (leave background)
     }
   }
-
-  free(outputRow);
-  free(rowBytes);
 }
 
 void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state) const {
@@ -861,11 +984,7 @@ void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoi
   if (maxY >= getScreenHeight()) maxY = getScreenHeight() - 1;
 
   // Allocate node buffer for scanline algorithm
-  auto* nodeX = static_cast<int*>(malloc(numPoints * sizeof(int)));
-  if (!nodeX) {
-    LOG_ERR("GFX", "!! Failed to allocate polygon node buffer");
-    return;
-  }
+  std::vector<int> nodeX(numPoints);
 
   // Scanline fill algorithm
   for (int scanY = minY; scanY <= maxY; scanY++) {
@@ -885,7 +1004,7 @@ void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoi
     }
 
     // Sort nodes by X
-    std::sort(nodeX, nodeX + nodes);
+    std::sort(nodeX.begin(), nodeX.begin() + nodes);
 
     // Fill between pairs of nodes
     for (int i = 0; i < nodes - 1; i += 2) {
@@ -902,8 +1021,6 @@ void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoi
       }
     }
   }
-
-  free(nodeX);
 }
 
 // For performance measurement (using static to allow "const" methods)
@@ -931,59 +1048,59 @@ void GfxRenderer::displayWindow(const int x, const int y, const int width, const
   display.displayWindow(x, y, width, height, refreshMode, fadingFix);
 }
 
-std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
+std::string GfxRenderer::truncatedText(const int fontId, std::string_view text, const int maxWidth,
                                        const EpdFontFamily::Style style) const {
-  if (!text || maxWidth <= 0) return "";
+  if (text.empty() || maxWidth <= 0) return "";
 
-  std::string item = text;
+  std::string item(text);
   // U+2026 HORIZONTAL ELLIPSIS (UTF-8: 0xE2 0x80 0xA6)
   const char* ellipsis = "\xe2\x80\xa6";
-  int textWidth = getTextWidth(fontId, item.c_str(), style);
+  int textWidth = getTextWidth(fontId, item, style);
   if (textWidth <= maxWidth) {
     // Text fits, return as is
     return item;
   }
 
-  while (!item.empty() && getTextWidth(fontId, (item + ellipsis).c_str(), style) >= maxWidth) {
+  while (!item.empty() && getTextWidth(fontId, (item + ellipsis), style) >= maxWidth) {
     utf8RemoveLastChar(item);
   }
 
   return item.empty() ? ellipsis : item + ellipsis;
 }
 
-std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* text, const int maxWidth,
+std::vector<std::string> GfxRenderer::wrappedText(const int fontId, std::string_view text, const int maxWidth,
                                                   const int maxLines, const EpdFontFamily::Style style) const {
   std::vector<std::string> lines;
 
-  if (!text || maxWidth <= 0 || maxLines <= 0) return lines;
+  if (text.empty() || maxWidth <= 0 || maxLines <= 0) return lines;
 
-  std::string remaining = text;
+  std::string_view remaining = text;
   std::string currentLine;
 
   while (!remaining.empty()) {
     if (static_cast<int>(lines.size()) == maxLines - 1) {
       // Last available line: combine any word already started on this line with
       // the rest of the text, then let truncatedText fit it with an ellipsis.
-      std::string lastContent = currentLine.empty() ? remaining : currentLine + " " + remaining;
-      lines.push_back(truncatedText(fontId, lastContent.c_str(), maxWidth, style));
+      std::string lastContent = currentLine.empty() ? std::string(remaining) : currentLine + " " + std::string(remaining);
+      lines.push_back(truncatedText(fontId, lastContent, maxWidth, style));
       return lines;
     }
 
     // Find next word
     size_t spacePos = remaining.find(' ');
-    std::string word;
+    std::string_view word;
 
-    if (spacePos == std::string::npos) {
+    if (spacePos == std::string_view::npos) {
       word = remaining;
-      remaining.clear();
+      remaining = std::string_view();
     } else {
       word = remaining.substr(0, spacePos);
-      remaining.erase(0, spacePos + 1);
+      remaining.remove_prefix(spacePos + 1);
     }
 
-    std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
+    std::string testLine = currentLine.empty() ? std::string(word) : currentLine + " " + std::string(word);
 
-    if (getTextWidth(fontId, testLine.c_str(), style) <= maxWidth) {
+    if (getTextWidth(fontId, testLine, style) <= maxWidth) {
       currentLine = testLine;
     } else {
       if (!currentLine.empty()) {
@@ -991,18 +1108,18 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
         // If the carried-over word itself exceeds maxWidth, truncate it and
         // push it as a complete line immediately — storing it in currentLine
         // would allow a subsequent short word to be appended after the ellipsis.
-        if (getTextWidth(fontId, word.c_str(), style) > maxWidth) {
-          lines.push_back(truncatedText(fontId, word.c_str(), maxWidth, style));
+        if (getTextWidth(fontId, word, style) > maxWidth) {
+          lines.push_back(truncatedText(fontId, word, maxWidth, style));
           currentLine.clear();
           if (static_cast<int>(lines.size()) >= maxLines) return lines;
         } else {
-          currentLine = word;
+          currentLine = std::string(word);
         }
       } else {
         // Single word wider than maxWidth: truncate and stop to avoid complicated
         // splitting rules (different between languages). Results in an aesthetically
         // pleasing end.
-        lines.push_back(truncatedText(fontId, word.c_str(), maxWidth, style));
+        lines.push_back(truncatedText(fontId, word, maxWidth, style));
         return lines;
       }
     }
@@ -1077,7 +1194,7 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
   return fp4::toPixel(kernFP);                                           // snap 4.4 fixed-point to nearest pixel
 }
 
-int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style) const {
+int GfxRenderer::getTextAdvanceX(const int fontId, std::string_view text, EpdFontFamily::Style style) const {
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) {
     LOG_ERR("GFX", "Font %d not found", fontId);
@@ -1089,7 +1206,7 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   int widthPx = 0;
   int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
   const auto& font = fontIt->second;
-  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+  while ((cp = utf8NextCodepoint(text))) {
     if (utf8IsCombiningMark(cp)) {
       continue;
     }
@@ -1139,10 +1256,10 @@ int GfxRenderer::getTextHeight(const int fontId) const {
   return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
 }
 
-void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y, const char* text, const bool black,
+void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y, std::string_view text, const bool black,
                                       const EpdFontFamily::Style style) const {
-  // Cannot draw a NULL / empty string
-  if (text == nullptr || *text == '\0') {
+  // cannot draw an empty string
+  if (text.empty()) {
     return;
   }
 
@@ -1162,7 +1279,7 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
   uint32_t cp;
   uint32_t prevCp = 0;
-  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+  while ((cp = utf8NextCodepoint(text))) {
     if (utf8IsCombiningMark(cp)) {
       const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
       if (!combiningGlyph) continue;
@@ -1207,14 +1324,9 @@ void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuff
 void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
 
 void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
-
 void GfxRenderer::freeBwBufferChunks() {
-  for (auto& bwBufferChunk : bwBufferChunks) {
-    if (bwBufferChunk) {
-      free(bwBufferChunk);
-      bwBufferChunk = nullptr;
-    }
-  }
+  bwBufferChunks.clear();
+  bwBufferChunks.shrink_to_fit();
 }
 
 /**
@@ -1224,27 +1336,23 @@ void GfxRenderer::freeBwBufferChunks() {
  * Returns true if buffer was stored successfully, false if allocation failed.
  */
 bool GfxRenderer::storeBwBuffer() {
-  // Allocate and copy each chunk
-  for (size_t i = 0; i < bwBufferChunks.size(); i++) {
-    // Check if any chunks are already allocated
-    if (bwBufferChunks[i]) {
-      LOG_ERR("GFX", "!! BW buffer chunk %zu already stored - this is likely a bug, freeing chunk", i);
-      free(bwBufferChunks[i]);
-      bwBufferChunks[i] = nullptr;
-    }
+  if (!frameBuffer) return false;
 
+  freeBwBufferChunks();
+
+  const size_t numChunks = (frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
+  bwBufferChunks.reserve(numChunks);
+
+  for (size_t i = 0; i < numChunks; i++) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
     const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
-    bwBufferChunks[i] = static_cast<uint8_t*>(malloc(chunkSize));
 
-    if (!bwBufferChunks[i]) {
+    bwBufferChunks.emplace_back(frameBuffer + offset, frameBuffer + offset + chunkSize);
+    if (bwBufferChunks.back().size() != chunkSize) {
       LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
-      // Free previously allocated chunks
       freeBwBufferChunks();
       return false;
     }
-
-    memcpy(bwBufferChunks[i], frameBuffer + offset, chunkSize);
   }
 
   LOG_DBG("GFX", "Stored BW buffer in %zu chunks (%zu bytes each)", bwBufferChunks.size(), BW_BUFFER_CHUNK_SIZE);
@@ -1257,24 +1365,14 @@ bool GfxRenderer::storeBwBuffer() {
  * Uses chunked restoration to match chunked storage.
  */
 void GfxRenderer::restoreBwBuffer() {
-  // Check if all chunks are allocated
-  bool missingChunks = false;
-  for (const auto& bwBufferChunk : bwBufferChunks) {
-    if (!bwBufferChunk) {
-      missingChunks = true;
-      break;
-    }
-  }
-
-  if (missingChunks) {
-    freeBwBufferChunks();
+  if (bwBufferChunks.empty()) {
     return;
   }
 
   for (size_t i = 0; i < bwBufferChunks.size(); i++) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
-    const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
-    memcpy(frameBuffer + offset, bwBufferChunks[i], chunkSize);
+    const size_t chunkSize = bwBufferChunks[i].size();
+    memcpy(frameBuffer + offset, bwBufferChunks[i].data(), chunkSize);
   }
 
   display.cleanupGrayscaleBuffers(frameBuffer);
