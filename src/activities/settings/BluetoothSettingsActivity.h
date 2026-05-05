@@ -19,6 +19,8 @@ class BluetoothSettingsActivity : public Activity {
   enum class LearnStep {
     WAIT_PREV,
     WAIT_NEXT,
+    WAIT_CONFIRM,  // Optional 3rd button: BTN_CONFIRM action
+    WAIT_CANCEL,   // Optional 4th button: BTN_BACK action
     WAIT_TEST,
     DONE
   };
@@ -33,6 +35,8 @@ class BluetoothSettingsActivity : public Activity {
   uint8_t pendingLearnIndex = 0xFF;
   uint8_t learnedPrevKey = 0;
   uint8_t learnedNextKey = 0;
+  uint8_t learnedConfirmKey = 0;  // 0 = not learned (skipped or never set)
+  uint8_t learnedCancelKey = 0;   // 0 = not learned
   uint8_t learnedReportIndex = 2;
   unsigned long learnTestDeadlineMs = 0;
   bool learnTestForwardSeen = false;
@@ -47,6 +51,11 @@ class BluetoothSettingsActivity : public Activity {
   uint16_t debugUniqueCounts[kDebugUniqueKeyMax] = {0};
   uint8_t debugUniqueCount = 0;
   bool exitOnSuccessfulConnect = false;
+
+  // Device-list view state
+  std::string highlightedAddress;            // BLE address the cursor is "on" (so sort doesn't lose it)
+  bool showOnlyHID = false;                  // Filter list to HID-advertising devices only
+  unsigned long lastDeviceListRefresh = 0;   // millis() of last live re-render during scan
 
  public:
   explicit BluetoothSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -71,6 +80,6 @@ class BluetoothSettingsActivity : public Activity {
   void renderLearnKeys();
   void renderDebugMonitor();
   std::string getSignalStrengthIndicator(const int32_t rssi) const;
-  
+
   const std::function<void()> onComplete;
 };

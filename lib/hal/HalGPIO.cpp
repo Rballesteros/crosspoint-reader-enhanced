@@ -208,7 +208,10 @@ void HalGPIO::begin() {
 
 void HalGPIO::update() {
   previousVirtualButtonState = virtualButtonState;
-  virtualButtonState = desiredVirtualButtonState;
+  // OR in any latched presses so a short BLE press that was already released
+  // before this update() is still visible as a rising edge for exactly one frame.
+  virtualButtonState = desiredVirtualButtonState | virtualPressLatch;
+  virtualPressLatch = 0;
 
   inputMgr.update();
   const bool connected = isUsbConnected();
@@ -298,6 +301,7 @@ void HalGPIO::setVirtualButtonState(uint8_t buttonIndex, bool pressed) {
     }
 
     desiredVirtualButtonState |= mask;
+    virtualPressLatch |= mask;
     virtualPressStart[buttonIndex] = now;
     virtualLastActivityTime[buttonIndex] = now;
   } else {
@@ -324,6 +328,7 @@ void HalGPIO::clearVirtualButtons() {
   virtualButtonState = 0;
   desiredVirtualButtonState = 0;
   previousVirtualButtonState = 0;
+  virtualPressLatch = 0;
   for (uint8_t buttonIndex = 0; buttonIndex <= BTN_POWER; ++buttonIndex) {
     virtualPressStart[buttonIndex] = 0;
     virtualPressFinish[buttonIndex] = 0;

@@ -45,6 +45,7 @@ class HalGPIO {
   uint8_t virtualButtonState = 0;          // Current virtual button state
   uint8_t desiredVirtualButtonState = 0;   // State requested by async injectors
   uint8_t previousVirtualButtonState = 0;  // Previous frame virtual state
+  uint8_t virtualPressLatch = 0;           // Presses that fired and released before update() ran
   unsigned long virtualPressStart[7] = {0};
   unsigned long virtualPressFinish[7] = {0};
   unsigned long virtualLastActivityTime[7] = {0};

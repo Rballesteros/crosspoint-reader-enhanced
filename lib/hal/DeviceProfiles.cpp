@@ -10,7 +10,7 @@ namespace {
 constexpr const char* CUSTOM_PROFILE_FILE = "/.crosspoint/ble_custom_profile.txt";
 constexpr const char* DEVICE_PROFILE_FILE = "/.crosspoint/ble_device_profiles.txt";
 
-DeviceProfiles::DeviceProfile customProfile = {"Custom BLE Remote", nullptr, 0x00, 0x00, false, 2, false};
+DeviceProfiles::DeviceProfile customProfile = {"Custom BLE Remote", nullptr, 0x00, 0x00, false, 2, false, 0x00, 0x00};
 bool customProfileLoaded = false;
 std::map<std::string, DeviceProfiles::DeviceProfile> perDeviceProfiles;
 bool perDeviceProfilesLoaded = false;
@@ -32,9 +32,13 @@ void savePerDeviceProfilesToStorage() {
   for (const auto& entry : perDeviceProfiles) {
     const auto& addr = entry.first;
     const auto& profile = entry.second;
-    char line[80];
-    snprintf(line, sizeof(line), "%s,%u,%u,%u\n", addr.c_str(), static_cast<unsigned>(profile.pageUpCode),
-             static_cast<unsigned>(profile.pageDownCode), static_cast<unsigned>(profile.reportByteIndex));
+    char line[96];
+    // Format: <addr>,<up>,<down>,<reportIndex>,<confirm>,<cancel>
+    // Older firmware wrote only the first four fields. Loaders default
+    // confirm/cancel to 0 when the trailing fields are missing.
+    snprintf(line, sizeof(line), "%s,%u,%u,%u,%u,%u\n", addr.c_str(), static_cast<unsigned>(profile.pageUpCode),
+             static_cast<unsigned>(profile.pageDownCode), static_cast<unsigned>(profile.reportByteIndex),
+             static_cast<unsigned>(profile.confirmCode), static_cast<unsigned>(profile.cancelCode));
     all += line;
   }
 
@@ -70,11 +74,23 @@ void loadPerDeviceProfilesFromStorage() {
       unsigned int up = 0;
       unsigned int down = 0;
       unsigned int reportIndex = 2;
-      const int parsed = sscanf(line.c_str(), "%31[^,],%u,%u,%u", addrBuf, &up, &down, &reportIndex);
-      if (parsed == 4 && up <= 0xFF && down <= 0xFF && up != 0 && down != 0 && reportIndex <= 0xFF) {
-        DeviceProfiles::DeviceProfile profile = {"Custom BLE Remote", nullptr, static_cast<uint8_t>(up),
-                                                 static_cast<uint8_t>(down), false,
-                                                 static_cast<uint8_t>(reportIndex), false};
+      unsigned int confirm = 0;
+      unsigned int cancel = 0;
+      // Accept both legacy 4-field and new 6-field formats. Trailing menu codes
+      // default to 0 when absent (= "not learned").
+      const int parsed = sscanf(line.c_str(), "%31[^,],%u,%u,%u,%u,%u", addrBuf, &up, &down, &reportIndex, &confirm,
+                                &cancel);
+      if (parsed >= 4 && up <= 0xFF && down <= 0xFF && up != 0 && down != 0 && reportIndex <= 0xFF &&
+          confirm <= 0xFF && cancel <= 0xFF) {
+        DeviceProfiles::DeviceProfile profile = {"Custom BLE Remote",
+                                                 nullptr,
+                                                 static_cast<uint8_t>(up),
+                                                 static_cast<uint8_t>(down),
+                                                 false,
+                                                 static_cast<uint8_t>(reportIndex),
+                                                 false,
+                                                 static_cast<uint8_t>(confirm),
+                                                 static_cast<uint8_t>(cancel)};
         perDeviceProfiles[normalizeAddress(addrBuf)] = profile;
       }
     }
@@ -102,13 +118,21 @@ void loadCustomProfileFromStorage() {
   unsigned int up = 0;
   unsigned int down = 0;
   unsigned int reportIndex = 2;
-  const int parsed = sscanf(content.c_str(), "%u,%u,%u", &up, &down, &reportIndex);
-  if ((parsed == 2 || parsed == 3) && up <= 0xFF && down <= 0xFF && up != 0 && down != 0 && reportIndex <= 0xFF) {
+  unsigned int confirm = 0;
+  unsigned int cancel = 0;
+  // Accept legacy 2/3-field and new 5-field formats. Trailing menu codes
+  // default to 0 when absent.
+  const int parsed = sscanf(content.c_str(), "%u,%u,%u,%u,%u", &up, &down, &reportIndex, &confirm, &cancel);
+  if (parsed >= 2 && up <= 0xFF && down <= 0xFF && up != 0 && down != 0 && reportIndex <= 0xFF &&
+      confirm <= 0xFF && cancel <= 0xFF) {
     customProfile.pageUpCode = static_cast<uint8_t>(up);
     customProfile.pageDownCode = static_cast<uint8_t>(down);
     customProfile.reportByteIndex = static_cast<uint8_t>(reportIndex);
-    LOG_INF("DEV", "Loaded custom BLE profile: up=0x%02X down=0x%02X idx=%u", customProfile.pageUpCode,
-            customProfile.pageDownCode, static_cast<unsigned>(customProfile.reportByteIndex));
+    customProfile.confirmCode = static_cast<uint8_t>(confirm);
+    customProfile.cancelCode = static_cast<uint8_t>(cancel);
+    LOG_INF("DEV", "Loaded custom BLE profile: up=0x%02X down=0x%02X idx=%u confirm=0x%02X cancel=0x%02X",
+            customProfile.pageUpCode, customProfile.pageDownCode, static_cast<unsigned>(customProfile.reportByteIndex),
+            customProfile.confirmCode, customProfile.cancelCode);
   }
 }
 }  // namespace
@@ -331,29 +355,50 @@ bool getCustomProfileForDevice(const std::string& macAddress, DeviceProfile& out
   return true;
 }
 
-void setCustomProfile(uint8_t pageUpCode, uint8_t pageDownCode, uint8_t reportByteIndex) {
+// Plausible upper bound for an HID report byte offset. Standard keyboard reports
+// are 8 bytes; vendor-specific clickers we've seen top out below 16. Anything
+// larger is almost certainly captured noise rather than a real input position.
+constexpr uint8_t MAX_REPORT_BYTE_INDEX = 20;
+
+void setCustomProfile(uint8_t pageUpCode, uint8_t pageDownCode, uint8_t reportByteIndex, uint8_t confirmCode,
+                      uint8_t cancelCode) {
+  if (reportByteIndex > MAX_REPORT_BYTE_INDEX) {
+    LOG_ERR("DEV", "Rejecting custom profile: reportByteIndex %u exceeds max %u",
+            static_cast<unsigned>(reportByteIndex), static_cast<unsigned>(MAX_REPORT_BYTE_INDEX));
+    return;
+  }
   customProfile.pageUpCode = pageUpCode;
   customProfile.pageDownCode = pageDownCode;
   customProfile.reportByteIndex = reportByteIndex;
+  customProfile.confirmCode = confirmCode;
+  customProfile.cancelCode = cancelCode;
   customProfileLoaded = true;
 
   Storage.mkdir("/.crosspoint");
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%u,%u,%u", static_cast<unsigned>(pageUpCode), static_cast<unsigned>(pageDownCode),
-           static_cast<unsigned>(reportByteIndex));
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%u,%u,%u,%u,%u", static_cast<unsigned>(pageUpCode), static_cast<unsigned>(pageDownCode),
+           static_cast<unsigned>(reportByteIndex), static_cast<unsigned>(confirmCode),
+           static_cast<unsigned>(cancelCode));
   Storage.writeFile(CUSTOM_PROFILE_FILE, buf);
-  LOG_INF("DEV", "Custom profile set: up=0x%02X down=0x%02X idx=%u", pageUpCode, pageDownCode,
-          static_cast<unsigned>(reportByteIndex));
+  LOG_INF("DEV", "Custom profile set: up=0x%02X down=0x%02X idx=%u confirm=0x%02X cancel=0x%02X", pageUpCode,
+          pageDownCode, static_cast<unsigned>(reportByteIndex), confirmCode, cancelCode);
 }
 
 void setCustomProfileForDevice(const std::string& macAddress, uint8_t pageUpCode, uint8_t pageDownCode,
-                               uint8_t reportByteIndex) {
+                               uint8_t reportByteIndex, uint8_t confirmCode, uint8_t cancelCode) {
+  if (reportByteIndex > MAX_REPORT_BYTE_INDEX) {
+    LOG_ERR("DEV", "Rejecting per-device profile for %s: reportByteIndex %u exceeds max %u", macAddress.c_str(),
+            static_cast<unsigned>(reportByteIndex), static_cast<unsigned>(MAX_REPORT_BYTE_INDEX));
+    return;
+  }
   loadPerDeviceProfilesFromStorage();
-  DeviceProfile profile = {"Custom BLE Remote", nullptr, pageUpCode, pageDownCode, false, reportByteIndex, false};
+  DeviceProfile profile = {"Custom BLE Remote", nullptr,        pageUpCode, pageDownCode, false,
+                           reportByteIndex,    false,           confirmCode, cancelCode};
   perDeviceProfiles[normalizeAddress(macAddress)] = profile;
   savePerDeviceProfilesToStorage();
-  LOG_INF("DEV", "Saved per-device BLE profile for %s: up=0x%02X down=0x%02X idx=%u", macAddress.c_str(),
-          pageUpCode, pageDownCode, static_cast<unsigned>(reportByteIndex));
+  LOG_INF("DEV", "Saved per-device BLE profile for %s: up=0x%02X down=0x%02X idx=%u confirm=0x%02X cancel=0x%02X",
+          macAddress.c_str(), pageUpCode, pageDownCode, static_cast<unsigned>(reportByteIndex), confirmCode,
+          cancelCode);
 }
 
 void clearCustomProfileForDevice(const std::string& macAddress) {
@@ -367,6 +412,8 @@ void clearCustomProfile() {
   customProfile.pageUpCode = 0x00;
   customProfile.pageDownCode = 0x00;
   customProfile.reportByteIndex = 2;
+  customProfile.confirmCode = 0x00;
+  customProfile.cancelCode = 0x00;
   customProfileLoaded = true;
   Storage.remove(CUSTOM_PROFILE_FILE);
   perDeviceProfiles.clear();

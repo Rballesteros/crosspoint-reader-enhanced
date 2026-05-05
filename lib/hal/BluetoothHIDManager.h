@@ -17,6 +17,9 @@ struct BluetoothDevice {
   std::string name;
   int rssi;
   bool isHID = false;
+  uint8_t addrType = 0;  // BLE_ADDR_PUBLIC; populated from advertisedDevice->getAddress().getType()
+  uint16_t appearance = 0;     // BLE Appearance category (0 = unknown)
+  uint16_t companyId = 0xFFFF; // Manufacturer Bluetooth SIG company ID (0xFFFF = none)
 };
 
 struct ConnectedDevice {
@@ -38,6 +41,10 @@ struct ConnectedDevice {
   bool simpleFallbackEnabled = false;
   uint8_t simpleForwardKeycode = 0x00;
   uint8_t simpleBackKeycode = 0x00;
+  // Optional learned menu-action keycodes for clickers with more than two
+  // buttons. 0x00 means "not learned" — leave page-nav behavior unchanged.
+  uint8_t simpleConfirmKeycode = 0x00;
+  uint8_t simpleCancelKeycode = 0x00;
   bool descriptorHasConsumerPage = false;
   bool descriptorHasKeyboardPage = false;
   uint8_t descriptorSuggestedIndex = 0xFF;
@@ -59,22 +66,33 @@ public:
   // Singleton access
   static BluetoothHIDManager& getInstance();
 
+  static constexpr const char* ERROR_CONNECTION_FAILED = "BT_CONNECTION_FAILED";
+  static constexpr const char* ERROR_CONNECTION_TIMEOUT = "BT_CONNECTION_TIMEOUT";
+  static constexpr const char* ERROR_REMOTE_SLEEP_RETRY = "BT_REMOTE_SLEEP_RETRY";
+
   // Lifecycle
   bool enable();
   bool disable();
-  bool isEnabled() const { return _enabled; }
+  bool isEnabled() const;
 
   // Scanning
   void startScan(uint32_t durationMs = 10000);
   void stopScan();
-  bool isScanning() const { return _scanning; }
-  const std::vector<BluetoothDevice>& getDiscoveredDevices() const { return _discoveredDevices; }
+  bool isScanning() const;
+
+  // Returns a thread-safe copy of the discovered devices
+  std::vector<BluetoothDevice> getDiscoveredDevicesCopy() const;
 
   // Connection
-  bool connectToDevice(const std::string& address);
+  bool connectToDevice(const std::string& address, uint8_t addrTypeOverride = 0, bool useAddrTypeOverride = false);
   bool disconnectFromDevice(const std::string& address);
   bool isConnected(const std::string& address) const;
-  std::vector<std::string> getConnectedDevices() const;
+  std::vector<ConnectedDevice> getConnectedDevicesCopy() const;
+
+  // Probe an advertised device to read its GATT Device Name (0x2A00) without
+  // committing to a full HID connection. Updates the matching entry in
+  // _discoveredDevices on success. Returns true if a non-empty name was read.
+  bool identifyDevice(const std::string& address);
 
   // Input handling
   void processInputEvents();
@@ -82,13 +100,13 @@ public:
   void setLearnInputCallback(std::function<void(uint8_t keycode, uint8_t reportIndex)> callback);
   void setButtonInjector(std::function<void(uint8_t buttonIndex, bool pressed)> injector);
   void setReaderContextCallback(std::function<bool()> callback);
-    void setButtonActivityNotifier(std::function<void(uint8_t buttonIndex)> notifier);
+  void setButtonActivityNotifier(std::function<void(uint8_t buttonIndex)> notifier);
   void setDebugCaptureEnabled(bool enabled) { _debugCaptureEnabled = enabled; }
   bool isDebugCaptureEnabled() const { return _debugCaptureEnabled; }
-  void setBondedDevice(const std::string& address, const std::string& name = "");
+  void setBondedDevice(const std::string& address, const std::string& name = "", uint8_t addrType = 0);
   void updateActivity();  // Call periodically to check inactivity timeout
   void checkAutoReconnect(bool userInputDetected = false);  // Reconnect bonded device when disconnected
-  
+
   // Check if BLE has had activity recently (within last 4 minutes)
   // Used by power manager to prevent sleep during BLE use
   bool hasRecentActivity() const;
@@ -102,6 +120,8 @@ public:
 
   // BLE callbacks (public for NimBLE callbacks)
   void onScanResult(NimBLEAdvertisedDevice* advertisedDevice);
+  void onScanEnded();
+  void onClientDisconnected(const std::string& address, int reason);
   static void onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
 
 private:
@@ -112,22 +132,28 @@ private:
 
   void cleanup();
   uint16_t parseHIDReport(uint8_t* data, size_t length);
+  // Caller must hold _stateMutex while using the returned pointer.
   ConnectedDevice* findConnectedDevice(const std::string& address);
   uint8_t mapKeycodeToButton(uint8_t keycode, ConnectedDevice* device);
 
   bool _enabled = false;
   bool _scanning = false;
   std::vector<BluetoothDevice> _discoveredDevices;
+  mutable SemaphoreHandle_t _stateMutex = nullptr;
   std::vector<ConnectedDevice> _connectedDevices;
   std::function<void(uint16_t)> _inputCallback;
   std::function<void(uint8_t, uint8_t)> _learnInputCallback;
   std::function<void(uint8_t, bool)> _buttonInjector;
   std::function<bool()> _readerContextCallback;
-    std::function<void(uint8_t)> _buttonActivityNotifier;
+  std::function<void(uint8_t)> _buttonActivityNotifier;
   bool _debugCaptureEnabled = false;
   std::string _bondedDeviceAddress;
   std::string _bondedDeviceName;
-  
+  uint8_t _bondedDeviceAddrType = 0;  // BLE_ADDR_PUBLIC default
+  char _lastDisconnectAddress[18] = {0};
+  int _lastDisconnectReason = 0;
+  unsigned long _lastDisconnectTime = 0;
+
   // Inactivity timeout (milliseconds)
   static constexpr unsigned long INACTIVITY_TIMEOUT_MS = 300000;  // 5 minutes
   unsigned long lastMaintenanceCheck = 0;

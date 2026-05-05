@@ -49,6 +49,11 @@ struct DeviceProfile {
   // byte positions) and MUST NOT be silently overridden by the user-learned custom profile.
   // Leave false for standard keyboard/consumer layouts that can safely be superseded.
   bool strictProfile;         // If true, custom profile cannot override this profile
+  // Optional menu-action keycodes for clickers with more than two buttons.
+  // 0x00 means "not set" — falls back to existing behavior. Honored only on
+  // non-strict profiles and on user-learned custom profiles.
+  uint8_t confirmCode = 0x00; // HID keycode for Confirm/Select action
+  uint8_t cancelCode = 0x00;  // HID keycode for Back/Cancel action
 };
 
 // Known device profiles (database of popular page turners)
@@ -118,15 +123,18 @@ const DeviceProfile* getCustomProfile();
 bool getCustomProfileForDevice(const std::string& macAddress, DeviceProfile& outProfile);
 
 /**
- * Set a user-configured device profile in settings
+ * Set a user-configured device profile in settings.
+ * Optional confirmCode / cancelCode default to 0x00 (= not learned), which
+ * preserves the prior 2-button behavior.
  */
-void setCustomProfile(uint8_t pageUpCode, uint8_t pageDownCode, uint8_t reportByteIndex);
+void setCustomProfile(uint8_t pageUpCode, uint8_t pageDownCode, uint8_t reportByteIndex,
+                      uint8_t confirmCode = 0x00, uint8_t cancelCode = 0x00);
 
 /**
  * Set a device-specific learned profile in settings.
  */
 void setCustomProfileForDevice(const std::string& macAddress, uint8_t pageUpCode, uint8_t pageDownCode,
-                               uint8_t reportByteIndex);
+                               uint8_t reportByteIndex, uint8_t confirmCode = 0x00, uint8_t cancelCode = 0x00);
 
 /**
  * Remove a device-specific learned profile.

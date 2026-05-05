@@ -4,6 +4,8 @@
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
 #include <WiFi.h>
+#include <algorithm>
+#include <cstring>
 
 #if defined(ARDUINO) && __has_include(<esp32-hal-bt-mem.h>)
 // Arduino-ESP32 3.x releases BT controller memory during startup unless a
@@ -35,9 +37,94 @@ constexpr uint16_t BLE_CONN_LATENCY = 0;
 constexpr uint16_t BLE_CONN_TIMEOUT = 600;       // 6s
 constexpr uint16_t BLE_CONN_SCAN_INTERVAL = 60;
 constexpr uint16_t BLE_CONN_SCAN_WINDOW = 30;
-constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 10000;
+constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 4000;
 constexpr unsigned long FREE2_STALE_RELEASE_DEFAULT_MS = 250;
 constexpr unsigned long FREE2_STALE_RELEASE_READER_MS = 500;
+constexpr size_t MAX_DISCOVERED_DEVICES = 50;
+constexpr unsigned long RECENT_DISCONNECT_WINDOW_MS = 15000;
+
+class StateLock {
+ public:
+  explicit StateLock(SemaphoreHandle_t mutex) : mutex(mutex) {
+    if (mutex) {
+      locked = (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE);
+    }
+  }
+
+  ~StateLock() {
+    if (locked) {
+      xSemaphoreGive(mutex);
+    }
+  }
+
+  StateLock(const StateLock&) = delete;
+  StateLock& operator=(const StateLock&) = delete;
+
+ private:
+  SemaphoreHandle_t mutex = nullptr;
+  bool locked = false;
+};
+
+bool isPlaceholderDeviceName(const std::string& name) {
+  return name.empty() || name == "Unknown" || name.rfind("?-", 0) == 0;
+}
+
+bool isHIDAppearance(const uint16_t appearance) {
+  return appearance >= 0x03C0 && appearance <= 0x03FF;
+}
+
+uint8_t discoveryPriority(const BluetoothDevice& device) {
+  if (device.isHID) return 4;
+  if (isHIDAppearance(device.appearance)) return 3;
+  if (isPlaceholderDeviceName(device.name)) return 2;
+  return 1;
+}
+
+bool compareDiscoveredDevice(const BluetoothDevice& a, const BluetoothDevice& b) {
+  const uint8_t aPriority = discoveryPriority(a);
+  const uint8_t bPriority = discoveryPriority(b);
+  if (aPriority != bPriority) return aPriority > bPriority;
+  return a.rssi > b.rssi;
+}
+
+const char* describeDisconnectReason(const int reason) {
+  switch (reason) {
+    case BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO):
+      return "connection supervision timeout";
+    case BLE_HS_HCI_ERR(BLE_ERR_REM_USER_CONN_TERM):
+      return "remote user terminated connection";
+    case BLE_HS_HCI_ERR(BLE_ERR_RD_CONN_TERM_RESRCS):
+      return "remote terminated due to resources";
+    case BLE_HS_HCI_ERR(BLE_ERR_RD_CONN_TERM_PWROFF):
+      return "remote powered off or slept";
+    case BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_LOCAL):
+      return "local host terminated connection";
+    case BLE_HS_HCI_ERR(BLE_ERR_CONN_ESTABLISHMENT):
+      return "connection establishment failed";
+    case BLE_HS_ETIMEOUT:
+      return "host timeout";
+    case BLE_HS_ETIMEOUT_HCI:
+      return "controller timeout";
+    default:
+      return "unknown";
+  }
+}
+
+const char* connectFailureMessage(const int reason) {
+  switch (reason) {
+    case BLE_HS_HCI_ERR(BLE_ERR_RD_CONN_TERM_PWROFF):
+      return BluetoothHIDManager::ERROR_REMOTE_SLEEP_RETRY;
+    case BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO):
+      return BluetoothHIDManager::ERROR_CONNECTION_TIMEOUT;
+    case BLE_HS_HCI_ERR(BLE_ERR_CONN_ESTABLISHMENT):
+      return BluetoothHIDManager::ERROR_CONNECTION_FAILED;
+    case BLE_HS_ETIMEOUT:
+    case BLE_HS_ETIMEOUT_HCI:
+      return BluetoothHIDManager::ERROR_CONNECTION_TIMEOUT;
+    default:
+      return BluetoothHIDManager::ERROR_CONNECTION_FAILED;
+  }
+}
 }
 
 struct ReportMapHints {
@@ -149,6 +236,12 @@ static BluetoothHIDManager* g_instance = nullptr;
 
 // Scan callbacks for NimBLE 2.x - keep as static to ensure it stays alive
 class ScanCallbacks : public NimBLEScanCallbacks {
+  void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    if (g_instance) {
+      g_instance->onScanResult(const_cast<NimBLEAdvertisedDevice*>(advertisedDevice));
+    }
+  }
+
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     if (g_instance) {
       // onScanResult expects non-const pointer, need to cast
@@ -157,10 +250,13 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       LOG_ERR("BT", "onResult called but g_instance is NULL!");
     }
   }
-  
+
   void onScanEnd(const NimBLEScanResults& results, int reason) override {
     (void)results;
     (void)reason;
+    if (g_instance) {
+      g_instance->onScanEnded();
+    }
   }
 };
 
@@ -172,9 +268,14 @@ class ClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pClient) override {
     LOG_INF("BT", "Client connected: %s", pClient->getPeerAddress().toString().c_str());
   }
-  
+
   void onDisconnect(NimBLEClient* pClient, int reason) override {
-    LOG_ERR("BT", "Client disconnected: %s (reason: %d)", pClient->getPeerAddress().toString().c_str(), reason);
+    const std::string address = pClient->getPeerAddress().toString();
+    LOG_ERR("BT", "Client disconnected: %s (reason: %d, %s)", address.c_str(), reason,
+            describeDisconnectReason(reason));
+    if (g_instance) {
+      g_instance->onClientDisconnected(address, reason);
+    }
   }
 };
 
@@ -188,26 +289,62 @@ BluetoothHIDManager& BluetoothHIDManager::getInstance() {
 
 BluetoothHIDManager::BluetoothHIDManager() {
   LOG_DBG("BT", "BluetoothHIDManager constructor");
+  _stateMutex = xSemaphoreCreateMutex();
+  if (!_stateMutex) {
+    LOG_ERR("BT", "Failed to create Bluetooth state mutex");
+  }
 }
 
 BluetoothHIDManager::~BluetoothHIDManager() {
   cleanup();
+  if (_stateMutex) {
+    vSemaphoreDelete(_stateMutex);
+    _stateMutex = nullptr;
+  }
 }
 
 void BluetoothHIDManager::cleanup() {
-  if (_enabled) {
+  if (isEnabled()) {
     disable();
   }
 }
 
+bool BluetoothHIDManager::isEnabled() const {
+  StateLock lock(_stateMutex);
+  return _enabled;
+}
+
+bool BluetoothHIDManager::isScanning() const {
+  StateLock lock(_stateMutex);
+  return _scanning;
+}
+
+std::vector<BluetoothDevice> BluetoothHIDManager::getDiscoveredDevicesCopy() const {
+  StateLock lock(_stateMutex);
+  std::vector<BluetoothDevice> copy = _discoveredDevices;
+  return copy;
+}
+
+std::vector<ConnectedDevice> BluetoothHIDManager::getConnectedDevicesCopy() const {
+  StateLock lock(_stateMutex);
+  std::vector<ConnectedDevice> copy;
+  copy.reserve(_connectedDevices.size());
+  for (const auto& device : _connectedDevices) {
+    if (device.client && device.client->isConnected()) {
+      copy.push_back(device);
+    }
+  }
+  return copy;
+}
+
 bool BluetoothHIDManager::enable() {
-  if (_enabled) {
+  if (isEnabled()) {
     LOG_DBG("BT", "Already enabled");
     return true;
   }
-  
+
   LOG_INF("BT", "Enabling Bluetooth...");
-  
+
   // CRITICAL: Disable WiFi when enabling Bluetooth
   // ESP32-C3 cannot have both WiFi and BLE enabled simultaneously
   if (WiFi.getMode() != WIFI_OFF) {
@@ -216,226 +353,408 @@ bool BluetoothHIDManager::enable() {
     WiFi.mode(WIFI_OFF);
     delay(100);  // Brief delay to ensure WiFi is fully powered down
   }
-  
+
   // Initialize NimBLE stack
   NimBLEDevice::init("CrossPoint");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9); // +9dBm
   NimBLEDevice::setDefaultPhy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
   NimBLEDevice::setSecurityAuth(true, false, true);
-  
-  _enabled = true;
+
+  {
+    StateLock lock(_stateMutex);
+    _enabled = true;
+  }
   lastError = "";
-  
+
   LOG_INF("BT", "Bluetooth enabled successfully");
   loadState();
   return true;
 }
 
 bool BluetoothHIDManager::disable() {
-  if (!_enabled) {
+  if (!isEnabled()) {
     LOG_DBG("BT", "Already disabled");
     return true;
   }
-  
+
   LOG_INF("BT", "Disabling Bluetooth...");
-  
-  if (_scanning) {
+
+  if (isScanning()) {
     stopScan();
   }
-  
+
   // Disconnect all devices
-  while (!_connectedDevices.empty()) {
-    disconnectFromDevice(_connectedDevices[0].address);
+  while (true) {
+    std::string address;
+    {
+      StateLock lock(_stateMutex);
+      if (_connectedDevices.empty()) {
+        break;
+      }
+      address = _connectedDevices.front().address;
+    }
+    if (!disconnectFromDevice(address)) {
+      break;
+    }
   }
-  
+
   // Deinitialize NimBLE stack
   NimBLEDevice::deinit(false);
-  
-  _enabled = false;
+
+  {
+    StateLock lock(_stateMutex);
+    _enabled = false;
+    _scanning = false;
+    _discoveredDevices.clear();
+  }
   lastError = "";
-  
+
   LOG_INF("BT", "Bluetooth disabled");
   return true;
 }
 
 void BluetoothHIDManager::startScan(uint32_t durationMs) {
-  if (!_enabled || _scanning) {
-    LOG_DBG("BT", "Cannot scan: enabled=%d scanning=%d", _enabled, _scanning);
-    return;
+  {
+    StateLock lock(_stateMutex);
+    if (!_enabled || _scanning) {
+      LOG_DBG("BT", "Cannot scan: enabled=%d scanning=%d", _enabled, _scanning);
+      return;
+    }
+
+    _scanning = true;
+    _discoveredDevices.clear();
+    // Reserve once per scan to avoid repeated vector growth in crowded BLE environments.
+    _discoveredDevices.reserve(MAX_DISCOVERED_DEVICES);
   }
-  
-  LOG_INF("BT", "Starting BLE scan for %lu ms", durationMs);
-  _scanning = true;
-  _discoveredDevices.clear();
-  
+
+  LOG_INF("BT", "Starting BLE scan for %lu ms (non-blocking)", durationMs);
+
   NimBLEScan* pScan = NimBLEDevice::getScan();
   if (!pScan) {
     LOG_ERR("BT", "Failed to get scan object");
-    _scanning = false;
+    {
+      StateLock lock(_stateMutex);
+      _scanning = false;
+    }
     lastError = "Scan failed";
     return;
   }
-  
-  // Use static callbacks object to ensure it stays alive
+
   pScan->setScanCallbacks(&scanCallbacks, false);
+  // The manager keeps its own capped snapshot, so do not let NimBLE retain a
+  // second internal result vector during crowded scans.
+  pScan->setMaxResults(0);
   pScan->setActiveScan(true);
   pScan->setInterval(100);
   pScan->setWindow(99);
-  
-  // In NimBLE 2.x, duration=0 means scan continuously until stop() is called
-  // Parameter 1: 0 = continuous scan
-  // Parameter 2: isContinue (false = clear old results)
-  bool started = pScan->start(0, false);
-  
+
+  // NimBLE 2.x: duration in ms; non-zero auto-stops the scan and triggers
+  // onScanEnd. Returns immediately so the UI loop stays responsive.
+  const bool started = pScan->start(durationMs, false);
   if (!started) {
     LOG_ERR("BT", "Failed to start scan!");
-    _scanning = false;
+    {
+      StateLock lock(_stateMutex);
+      _scanning = false;
+    }
     lastError = "Scan failed";
+  }
+}
+
+void BluetoothHIDManager::onScanEnded() {
+  size_t foundCount = 0;
+  {
+    StateLock lock(_stateMutex);
+    _scanning = false;
+    foundCount = _discoveredDevices.size();
+  }
+  LOG_INF("BT", "Scan complete, found %d devices", static_cast<int>(foundCount));
+}
+
+void BluetoothHIDManager::onClientDisconnected(const std::string& address, const int reason) {
+  StateLock lock(_stateMutex);
+  snprintf(_lastDisconnectAddress, sizeof(_lastDisconnectAddress), "%s", address.c_str());
+  _lastDisconnectReason = reason;
+  _lastDisconnectTime = millis();
+
+  auto it = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
+                         [&address](const ConnectedDevice& dev) { return dev.address == address; });
+  if (it == _connectedDevices.end()) {
     return;
   }
-  
-  // Wait for the specified duration
-  delay(durationMs);
-  
-  // Stop the scan
-  pScan->stop();
-  
-  _scanning = false;
-  LOG_INF("BT", "Scan complete, found %d devices", _discoveredDevices.size());
+
+  if (_buttonInjector && it->activeInjectedButton != 0xFF) {
+    _buttonInjector(it->activeInjectedButton, false);
+  }
+
+  LOG_DBG("BT", "Removing disconnected client entry: %s (%s)", address.c_str(), describeDisconnectReason(reason));
+  _connectedDevices.erase(it);
 }
 
 void BluetoothHIDManager::stopScan() {
-  if (!_scanning) return;
-  
+  {
+    StateLock lock(_stateMutex);
+    if (!_scanning) return;
+  }
+
   LOG_INF("BT", "Stopping scan");
-  
+
   NimBLEScan* pScan = NimBLEDevice::getScan();
   if (pScan) {
     pScan->stop();
   }
-  
-  _scanning = false;
+
+  {
+    StateLock lock(_stateMutex);
+    _scanning = false;
+  }
 }
 
 void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice) {
   if (!advertisedDevice) return;
-  
+
   std::string address = advertisedDevice->getAddress().toString();
   std::string name = advertisedDevice->getName();
   int rssi = advertisedDevice->getRSSI();
-  
+  const uint8_t advAddrType = advertisedDevice->getAddress().getType();
+
   // Check if device advertises HID service
   bool isHID = advertisedDevice->isAdvertisingService(NimBLEUUID(HID_SERVICE_UUID));
-  
+
+  // Pull lightweight identification hints from the advertisement so users can
+  // distinguish anonymous devices (e.g. "HID" or "Apple") without connecting.
+  uint16_t appearance = 0;
+  if (advertisedDevice->haveAppearance()) {
+    appearance = advertisedDevice->getAppearance();
+  }
+  uint16_t companyId = 0xFFFF;
+  if (advertisedDevice->haveManufacturerData()) {
+    const std::string mfg = advertisedDevice->getManufacturerData();
+    if (mfg.size() >= 2) {
+      // Bluetooth SIG company ID is little-endian in the first 2 bytes
+      companyId = static_cast<uint16_t>(static_cast<uint8_t>(mfg[0])) |
+                  (static_cast<uint16_t>(static_cast<uint8_t>(mfg[1])) << 8);
+    }
+  }
   // Check if we already have this device
+  StateLock lock(_stateMutex);
+  bool found = false;
   for (auto& dev : _discoveredDevices) {
     if (dev.address == address) {
       dev.rssi = rssi; // Update RSSI
+      if (!name.empty() && isPlaceholderDeviceName(dev.name)) {
+        dev.name = name;
+      }
       if (isHID) dev.isHID = true;
-      return;
+      dev.addrType = advAddrType;
+      if (appearance != 0) dev.appearance = appearance;
+      if (companyId != 0xFFFF) dev.companyId = companyId;
+      // Re-sort since RSSI / HID flag may have changed.
+      std::sort(_discoveredDevices.begin(), _discoveredDevices.end(), compareDiscoveredDevice);
+      found = true;
+      break;
     }
   }
-  
-  // Add new device
-  BluetoothDevice device;
-  device.address = address;
-  device.name = name.empty() ? "Unknown" : name;
-  device.rssi = rssi;
-  device.isHID = isHID;
-  
-  _discoveredDevices.push_back(device);
 
-  LOG_DBG("BT", "Found device: %s (%s) RSSI:%d HID:%d", 
-          device.name.c_str(), device.address.c_str(), rssi, isHID);
+  if (!found) {
+    // Add new device
+    BluetoothDevice device;
+    device.address = address;
+    if (!name.empty()) {
+      device.name = name;
+    } else if (address.size() >= 8) {
+      // No advertised name — show last 3 MAC octets so anonymous devices can be told apart
+      device.name = std::string("?-") + address.substr(address.size() - 8);
+    } else {
+      device.name = "Unknown";
+    }
+    device.rssi = rssi;
+    device.isHID = isHID;
+    device.addrType = advAddrType;
+    device.appearance = appearance;
+    device.companyId = companyId;
+
+    _discoveredDevices.push_back(device);
+
+    // Keep the list sorted: HID devices first, then regular devices, then non-HID Apple devices.
+    // Inside each category, sort by RSSI descending (closest first).
+    std::sort(_discoveredDevices.begin(), _discoveredDevices.end(), compareDiscoveredDevice);
+
+    // Enforce a hard cap to prevent Out-Of-Memory crashes in crowded environments.
+    // Because the list is sorted, resizing automatically drops the weakest non-HID devices.
+    if (_discoveredDevices.size() > MAX_DISCOVERED_DEVICES) {
+      _discoveredDevices.resize(MAX_DISCOVERED_DEVICES);
+    }
+  }
+
+  LOG_DBG("BT", "Found device: %s (%s) RSSI:%d HID:%d type:%u app:0x%04X mfg:0x%04X",
+          address.c_str(), address.c_str(), rssi, isHID, advAddrType, appearance, companyId);
 }
 
-bool BluetoothHIDManager::connectToDevice(const std::string& address) {
-  if (!_enabled) {
+bool BluetoothHIDManager::connectToDevice(const std::string& address, uint8_t addrTypeOverride,
+                                          bool useAddrTypeOverride) {
+  if (!isEnabled()) {
     LOG_ERR("BT", "Cannot connect: Bluetooth not enabled");
     lastError = "Bluetooth not enabled";
     return false;
   }
-  
+
   // Check if already connected
   if (isConnected(address)) {
     LOG_INF("BT", "Already connected to %s", address.c_str());
     return true;
   }
-  
-  LOG_INF("BT", "Connecting to device %s", address.c_str());
-  
-  NimBLEAddress bleAddress(address, BLE_ADDR_PUBLIC);
 
-    // Reuse existing disconnected client objects to avoid NimBLE deleteClient() on this target.
-    NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(bleAddress);
-    const bool hadExistingClient = (pClient != nullptr);
-    if (!pClient) {
-      pClient = NimBLEDevice::getDisconnectedClient();
-      if (pClient) {
-        pClient->setPeerAddress(bleAddress);
+  // Stop scanning before attempting to connect, otherwise NimBLE may fail to connect
+  if (isScanning()) {
+    stopScan();
+  }
+
+  // Resolve the BLE address type — many peripherals (rings, mice, modern phones) use
+  // random addresses, and connect() silently fails if the type is wrong. Look up from
+  // the most recent scan results first, then fall back to the bonded-device record
+  // (covers boot-time auto-reconnect where no scan has run yet).
+  uint8_t resolvedAddrType = BLE_ADDR_PUBLIC;
+  bool addrTypeFound = false;
+  bool foundInScan = false;
+  std::string scannedName;
+  std::string bondedName;
+  {
+    StateLock lock(_stateMutex);
+    if (useAddrTypeOverride) {
+      resolvedAddrType = addrTypeOverride;
+      addrTypeFound = true;
+    } else {
+      for (const auto& dev : _discoveredDevices) {
+        if (dev.address == address) {
+          resolvedAddrType = dev.addrType;
+          addrTypeFound = true;
+          foundInScan = true;
+          scannedName = dev.name;
+          break;
+        }
       }
     }
-    if (!pClient) {
-      pClient = NimBLEDevice::createClient(bleAddress);
+    if (!_bondedDeviceAddress.empty() && _bondedDeviceAddress == address) {
+      if (!addrTypeFound) {
+        resolvedAddrType = _bondedDeviceAddrType;
+      }
+      addrTypeFound = true;
+      bondedName = _bondedDeviceName;
+    }
+  }
+
+  LOG_INF("BT", "Connecting to device %s (addrType=%u, resolved=%d)",
+          address.c_str(), resolvedAddrType, addrTypeFound ? 1 : 0);
+
+  NimBLEAddress bleAddress(address, resolvedAddrType);
+
+  // Reuse existing disconnected client objects to avoid NimBLE deleteClient() on this target.
+  NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(bleAddress);
+  const bool hadExistingClient = (pClient != nullptr);
+  if (!pClient) {
+    pClient = NimBLEDevice::getDisconnectedClient();
+    if (pClient) {
+      pClient->setPeerAddress(bleAddress);
+    }
+  }
+  if (!pClient) {
+    pClient = NimBLEDevice::createClient(bleAddress);
+  }
+
+  if (!pClient) {
+    lastError = "Failed to create BLE client";
+    LOG_ERR("BT", "Failed to create BLE client");
+    return false;
+  }
+
+  // Set connection callbacks
+  static ClientCallbacks clientCallbacks;
+
+  // Keep client lifetime under manager control so disconnect callbacks do not free it in NimBLE context.
+  pClient->setSelfDelete(false, false);
+  pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+  pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY, BLE_CONN_TIMEOUT,
+                               BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
+  pClient->setClientCallbacks(&clientCallbacks);
+
+  if (!pClient->isConnected() && !hadExistingClient) {
+    pClient->deleteServices();
+  }
+
+  // Connect to device.
+  // Use deleteAttributes=false so we don't wipe the GATT cache.
+  // Use asyncConnect=false to block until connected.
+  // Use exchangeMTU=false because several cheap HID remotes disconnect during early MTU exchange.
+  if (!pClient->connect(bleAddress, false, false, false)) {
+    if (hadExistingClient) {
+      LOG_INF("BT", "Reconnect with existing client failed for %s, retrying with fresh client", address.c_str());
+      NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
+      if (freshClient) {
+        pClient = freshClient;
+        pClient->setSelfDelete(false, false);
+        pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+        pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
+                                     BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
+        pClient->setClientCallbacks(&clientCallbacks);
+      }
     }
 
-    if (!pClient) {
-      lastError = "Failed to create BLE client";
-      LOG_ERR("BT", "Failed to create BLE client");
-      return false;
-    }
-
-    // Keep client lifetime under manager control so disconnect callbacks do not free it in NimBLE context.
-    pClient->setSelfDelete(false, false);
-    pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
-    pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY, BLE_CONN_TIMEOUT,
-                                 BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-
-    if (!pClient->isConnected()) {
-      pClient->deleteServices();
-    }
-    
-    // Set connection callbacks
-    static ClientCallbacks clientCallbacks;
-    pClient->setClientCallbacks(&clientCallbacks);
-    
-    // Connect to device
-    if (!pClient->connect(bleAddress)) {
-      if (hadExistingClient) {
-        LOG_INF("BT", "Reconnect with existing client failed for %s, retrying with fresh client", address.c_str());
-        NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
-        if (freshClient) {
-          pClient = freshClient;
-          pClient->setSelfDelete(false, false);
-          pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
-          pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
-                                       BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-          pClient->setClientCallbacks(&clientCallbacks);
+    if (!pClient->connect(bleAddress, false, false, false)) {
+      int recentDisconnectReason = 0;
+      {
+        StateLock lock(_stateMutex);
+        if (strncmp(_lastDisconnectAddress, address.c_str(), sizeof(_lastDisconnectAddress)) == 0 &&
+            (millis() - _lastDisconnectTime) <= RECENT_DISCONNECT_WINDOW_MS) {
+          recentDisconnectReason = _lastDisconnectReason;
         }
       }
 
-      if (!pClient->connect(bleAddress)) {
-        lastError = "Connection failed";
-        LOG_ERR("BT", "Failed to connect to %s", address.c_str());
-        return false;
-      }
+      const int clientError = pClient ? pClient->getLastError() : 0;
+      const int reportedReason = recentDisconnectReason != 0 ? recentDisconnectReason : clientError;
+      lastError = connectFailureMessage(reportedReason);
+      LOG_ERR("BT", "Failed to connect to %s (err=%d, recentDisconnect=%d, %s)", address.c_str(),
+              clientError, recentDisconnectReason, describeDisconnectReason(reportedReason));
+      return false;
     }
+  }
+
+  {
+    StateLock lock(_stateMutex);
+    if (strncmp(_lastDisconnectAddress, address.c_str(), sizeof(_lastDisconnectAddress)) == 0) {
+      _lastDisconnectAddress[0] = '\0';
+      _lastDisconnectReason = 0;
+      _lastDisconnectTime = 0;
+    }
+  }
 
     const bool connParamsUpdated =
         pClient->updateConnParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY, BLE_CONN_TIMEOUT);
     LOG_INF("BT", "Connection params update request: %d", connParamsUpdated);
 
-    const bool dataLenUpdated = pClient->setDataLen(251);
-    LOG_INF("BT", "Data length extension request (251): %d", dataLenUpdated);
-
     const int connectedRssi = pClient->getRssi();
     LOG_INF("BT", "Connected RSSI for %s: %d dBm", address.c_str(), connectedRssi);
-    
+
+    // Explicitly initiate pairing/encryption.
+    // Many HID rings hide their HID service or drop the connection if pairing isn't initiated immediately.
+    LOG_INF("BT", "Initiating pairing/security...");
+    if (!pClient->secureConnection()) {
+      LOG_ERR("BT", "Failed to secure connection (proceeding anyway)");
+    }
+
     // Get HID service
     NimBLERemoteService* pService = pClient->getService(HID_SERVICE_UUID);
     if (!pService) {
       lastError = "HID service not found";
-      LOG_ERR("BT", "Device %s doesn't have HID service", address.c_str());
+      LOG_ERR("BT", "Device %s doesn't have HID service!", address.c_str());
+
+      // Dump all services to help debug proprietary TikTok rings
+      LOG_INF("BT", "Dumping available services for %s:", address.c_str());
+      auto services = pClient->getServices(true); // force discovery
+      for (auto* s : services) {
+        LOG_INF("BT", " - Found Service UUID: %s", s->getUUID().toString().c_str());
+      }
+
       pClient->disconnect();
       return false;
     }
@@ -460,27 +779,28 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
                 static_cast<int>(reportHints.preferredByteIndex), static_cast<unsigned>(reportMap.size()));
       }
     }
-    
+
     LOG_INF("BT", "Found HID service, enumerating report characteristics...");
-    
+
     // BLE HID has multiple report characteristics (input, output, feature)
     // We need to find one that supports NOTIFY or INDICATE (input report)
     // In NimBLE 2.x, getCharacteristics() returns std::vector<NimBLERemoteCharacteristic*>
     auto pCharacteristics = pService->getCharacteristics(true);
     NimBLERemoteCharacteristic* pReportChar = nullptr;
-    
+
     int reportCount = 0;
     std::vector<NimBLERemoteCharacteristic*> reportChars;
-    
+    reportChars.reserve(pCharacteristics.size());
+
     for (auto it = pCharacteristics.begin(); it != pCharacteristics.end(); ++it) {
       auto* pChar = *it;
       LOG_DBG("BT", "Characteristic UUID: %s, canRead:%d canWrite:%d canNotify:%d canIndicate:%d",
               pChar->getUUID().toString().c_str(),
               pChar->canRead(), pChar->canWrite(), pChar->canNotify(), pChar->canIndicate());
-      
+
       if (pChar->getUUID().equals(NimBLEUUID(HID_REPORT_UUID))) {
         reportCount++;
-        
+
         // Check if this report supports notify or indicate (input report)
         if (pChar->canNotify() || pChar->canIndicate()) {
           reportChars.push_back(pChar);
@@ -488,21 +808,21 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
         }
       }
     }
-    
+
     if (reportChars.empty()) {
       lastError = "No input report characteristic found";
       LOG_ERR("BT", "No Report characteristic with notify/indicate found");
       pClient->disconnect();
       return false;
     }
-    
+
     // Subscribe to ALL Report characteristics with notify capability
     LOG_INF("BT", "Subscribing to %d Report characteristics...", reportChars.size());
     size_t successfulSubscriptions = 0;
-    
+
     for (size_t i = 0; i < reportChars.size(); i++) {
       auto* pChar = reportChars[i];
-      
+
       // Clear stale CCCD state on reused clients where possible.
       (void)pChar->unsubscribe();
 
@@ -514,7 +834,7 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
       if (subResult) {
         successfulSubscriptions++;
       }
-      
+
       if (!subResult) {
         LOG_INF("BT", "Failed to subscribe to Report char #%d (continuing)", i + 1);
       }
@@ -526,10 +846,10 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
       pClient->disconnect();
       return false;
     }
-    
+
     LOG_INF("BT", "Subscribed to %u/%u HID Report characteristics",
             static_cast<unsigned>(successfulSubscriptions), static_cast<unsigned>(reportChars.size()));
-    
+
     // Save connection with activity timestamp
     ConnectedDevice connDev;
     connDev.address = address;
@@ -542,28 +862,43 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     connDev.descriptorHasKeyboardPage = reportHints.hasKeyboardPage;
     connDev.descriptorHasConsumerPage = reportHints.hasConsumerPage;
     connDev.descriptorSuggestedIndex = reportHints.preferredByteIndex;
-    
+
     // Detect device profile
     // First, try to find the device in scan results to get its name
-    bool foundInScan = false;
-    for (const auto& dev : _discoveredDevices) {
-      if (dev.address == address) {
-        connDev.name = dev.name;
-        foundInScan = true;
-        LOG_INF("BT", "Device found in scan results: %s (%s)", dev.name.c_str(), address.c_str());
-        break;
-      }
+    if (foundInScan) {
+      connDev.name = scannedName;
+      LOG_INF("BT", "Device found in scan results: %s (%s)", scannedName.c_str(), address.c_str());
     }
-    
+
     if (!foundInScan) {
       LOG_INF("BT", "Device not in scan results (may be previously paired): %s", address.c_str());
-      if (connDev.name.empty() && !_bondedDeviceAddress.empty() && _bondedDeviceAddress == address &&
-          !_bondedDeviceName.empty()) {
-        connDev.name = _bondedDeviceName;
+      if (connDev.name.empty() && !bondedName.empty()) {
+        connDev.name = bondedName;
         LOG_INF("BT", "Using bonded device name hint: %s", connDev.name.c_str());
       }
     }
-    
+
+    // If the advertisement didn't include a name (or it's our MAC-suffix placeholder),
+    // try the GATT Device Name characteristic (0x2A00 in the Generic Access service 0x1800).
+    const bool nameIsPlaceholder =
+        connDev.name.empty() ||
+        connDev.name == "Unknown" ||
+        connDev.name.rfind("?-", 0) == 0;
+    if (nameIsPlaceholder) {
+      if (auto* pGap = pClient->getService("1800")) {
+        if (auto* pDevName = pGap->getCharacteristic("2A00")) {
+          if (pDevName->canRead()) {
+            const std::string gattName = pDevName->readValue();
+            if (!gattName.empty()) {
+              connDev.name = gattName;
+              LOG_INF("BT", "Resolved name via GATT 0x2A00: %s", gattName.c_str());
+            }
+          }
+        }
+      }
+    }
+    if (connDev.name.empty()) connDev.name = "Unknown";
+
     // Profile matching priority:
     //  1. MAC-prefix exact match  (hardware ID, precise – always wins)
     //  2. Per-device learned profile by full MAC address
@@ -585,9 +920,13 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
         connDev.simpleFallbackEnabled = true;
         connDev.simpleBackKeycode = perDeviceProfile.pageUpCode;
         connDev.simpleForwardKeycode = perDeviceProfile.pageDownCode;
-        LOG_INF("BT", "Using per-device learned profile for %s: up=0x%02X down=0x%02X idx=%u", address.c_str(),
-          perDeviceProfile.pageUpCode, perDeviceProfile.pageDownCode,
-          static_cast<unsigned>(perDeviceProfile.reportByteIndex));
+        connDev.simpleConfirmKeycode = perDeviceProfile.confirmCode;
+        connDev.simpleCancelKeycode = perDeviceProfile.cancelCode;
+        LOG_INF("BT",
+                "Using per-device learned profile for %s: up=0x%02X down=0x%02X idx=%u confirm=0x%02X cancel=0x%02X",
+                address.c_str(), perDeviceProfile.pageUpCode, perDeviceProfile.pageDownCode,
+                static_cast<unsigned>(perDeviceProfile.reportByteIndex), perDeviceProfile.confirmCode,
+                perDeviceProfile.cancelCode);
       }
 
       // Prefer the user's learned mapping over a non-strict name-based guess.
@@ -606,9 +945,9 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
         }
       }
     }
-    
+
     if (connDev.profile) {
-      LOG_INF("BT", "✓ Using device profile: %s (byte[%d] for keycode)", 
+      LOG_INF("BT", "✓ Using device profile: %s (byte[%d] for keycode)",
               connDev.profile->name, connDev.profile->reportByteIndex);
       connDev.simpleFallbackEnabled = false;
     } else {
@@ -617,18 +956,32 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
         connDev.simpleFallbackEnabled = true;
         connDev.simpleForwardKeycode = 0x00;
         connDev.simpleBackKeycode = 0x00;
+        connDev.simpleConfirmKeycode = 0x00;
+        connDev.simpleCancelKeycode = 0x00;
       }
       LOG_INF("BT", "Simple fallback enabled for unknown device %s", address.c_str());
     }
-    
-    auto existing = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
-                                 [&address](const ConnectedDevice& dev) { return dev.address == address; });
-    if (existing != _connectedDevices.end()) {
-      *existing = connDev;
-    } else {
-      _connectedDevices.push_back(connDev);
+
+    {
+      StateLock lock(_stateMutex);
+      if (!connDev.name.empty() && !isPlaceholderDeviceName(connDev.name)) {
+        for (auto& dev : _discoveredDevices) {
+          if (dev.address == address && isPlaceholderDeviceName(dev.name)) {
+            dev.name = connDev.name;
+            break;
+          }
+        }
+      }
+
+      auto existing = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
+                                   [&address](const ConnectedDevice& dev) { return dev.address == address; });
+      if (existing != _connectedDevices.end()) {
+        *existing = connDev;
+      } else {
+        _connectedDevices.push_back(connDev);
+      }
     }
-    
+
     LOG_INF("BT", "Successfully connected to %s", address.c_str());
     lastError = "Connected";
     return true;
@@ -636,52 +989,137 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
 
 bool BluetoothHIDManager::disconnectFromDevice(const std::string& address) {
   LOG_INF("BT", "Disconnecting from device %s", address.c_str());
-  
-  auto it = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
-    [&address](const ConnectedDevice& dev) { return dev.address == address; });
-  
-  if (it != _connectedDevices.end()) {
+
+  NimBLEClient* client = nullptr;
+  {
+    StateLock lock(_stateMutex);
+    auto it = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
+      [&address](const ConnectedDevice& dev) { return dev.address == address; });
+
+    if (it == _connectedDevices.end()) {
+      LOG_INF("BT", "Device %s not in connected list", address.c_str());
+      return false;
+    }
+
     if (_buttonInjector && it->activeInjectedButton != 0xFF) {
       _buttonInjector(it->activeInjectedButton, false);
     }
-    NimBLEClient* client = it->client;
-
-    // Ensure normal CPU speed during BLE termination to avoid WDT in low-power mode.
-    if (client && client->isConnected()) {
-      HalPowerManager::Lock lock;
-      client->disconnect();
-    }
-
-    // Remove from our list
+    client = it->client;
+    // Remove from our list BEFORE disconnecting to avoid race conditions with onDisconnect callbacks
     _connectedDevices.erase(it);
-    LOG_INF("BT", "Disconnected from %s", address.c_str());
-    return true;
   }
-  
-  LOG_INF("BT", "Device %s not in connected list", address.c_str());
+
+  // Ensure normal CPU speed during BLE termination to avoid WDT in low-power mode.
+  if (client && client->isConnected()) {
+    HalPowerManager::Lock lock;
+    client->disconnect();
+  }
+
+  LOG_INF("BT", "Disconnected from %s", address.c_str());
+  return true;
+}
+
+bool BluetoothHIDManager::identifyDevice(const std::string& address) {
+  if (!isEnabled()) {
+    LOG_ERR("BT", "Cannot identify: Bluetooth not enabled");
+    lastError = "Bluetooth not enabled";
+    return false;
+  }
+  if (isConnected(address)) {
+    LOG_INF("BT", "Identify: already connected to %s, skipping", address.c_str());
+    return false;
+  }
+
+  // Stop scanning before attempting to connect
+  if (isScanning()) {
+    stopScan();
+  }
+
+  // Resolve address type from scan results (same logic as connectToDevice)
+  uint8_t addrType = BLE_ADDR_PUBLIC;
+  {
+    StateLock lock(_stateMutex);
+    for (const auto& dev : _discoveredDevices) {
+      if (dev.address == address) {
+        addrType = dev.addrType;
+        break;
+      }
+    }
+  }
+
+  LOG_INF("BT", "Identify probe: %s (addrType=%u)", address.c_str(), addrType);
+
+  NimBLEAddress bleAddress(address, addrType);
+  NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(bleAddress);
+  bool reusedClient = (pClient != nullptr);
+  if (!pClient) {
+    pClient = NimBLEDevice::getDisconnectedClient();
+    if (pClient) pClient->setPeerAddress(bleAddress);
+  }
+  if (!pClient) {
+    pClient = NimBLEDevice::createClient(bleAddress);
+  }
+  if (!pClient) {
+    lastError = "Identify: client alloc failed";
+    LOG_ERR("BT", "Identify: failed to create client for %s", address.c_str());
+    return false;
+  }
+
+  pClient->setSelfDelete(false, false);
+  pClient->setConnectTimeout(5000);  // shorter than full HID connect
+
+  std::string discoveredName;
+  if (pClient->connect(bleAddress)) {
+    if (auto* pGap = pClient->getService("1800")) {
+      if (auto* pDevName = pGap->getCharacteristic("2A00")) {
+        if (pDevName->canRead()) {
+          discoveredName = pDevName->readValue();
+        }
+      }
+    }
+    pClient->disconnect();
+  } else {
+    LOG_ERR("BT", "Identify: connect failed for %s", address.c_str());
+    lastError = "Identify failed";
+  }
+
+  // Free the temp client unless we reused an existing one (the reuse path is
+  // managed by the rest of the manager; deleting here would race with it).
+  if (!reusedClient) {
+    NimBLEDevice::deleteClient(pClient);
+  }
+
+  if (discoveredName.empty()) {
+    LOG_INF("BT", "Identify: %s did not expose a GATT name", address.c_str());
+    return false;
+  }
+
+  // Update the scan-results entry so the UI label refreshes
+  {
+    StateLock lock(_stateMutex);
+    for (auto& dev : _discoveredDevices) {
+      if (dev.address == address) {
+        dev.name = discoveredName;
+        LOG_INF("BT", "Identify: %s -> %s", address.c_str(), discoveredName.c_str());
+        return true;
+      }
+    }
+  }
   return false;
 }
 
 bool BluetoothHIDManager::isConnected(const std::string& address) const {
-  return std::find_if(_connectedDevices.begin(), _connectedDevices.end(), [&address](const ConnectedDevice& dev) {
+  StateLock lock(_stateMutex);
+  bool connected = std::find_if(_connectedDevices.begin(), _connectedDevices.end(), [&address](const ConnectedDevice& dev) {
            return dev.address == address && dev.client && dev.client->isConnected();
          }) != _connectedDevices.end();
-}
-
-std::vector<std::string> BluetoothHIDManager::getConnectedDevices() const {
-  std::vector<std::string> addresses;
-  for (const auto& dev : _connectedDevices) {
-    if (dev.client && dev.client->isConnected()) {
-      addresses.push_back(dev.address);
-    }
-  }
-  return addresses;
+  return connected;
 }
 
 ConnectedDevice* BluetoothHIDManager::findConnectedDevice(const std::string& address) {
   auto it = std::find_if(_connectedDevices.begin(), _connectedDevices.end(),
     [&address](const ConnectedDevice& dev) { return dev.address == address; });
-  
+
   if (it != _connectedDevices.end()) {
     return &(*it);
   }
@@ -693,40 +1131,71 @@ void BluetoothHIDManager::processInputEvents() {
   // This method is kept for potential polling-based implementations
 }
 
+// All callback setters lock the state mutex. The callbacks themselves are
+// invoked from the BLE notification path on the NimBLE stack task, so a torn
+// std::function write during reassignment could in principle expose a bad
+// invocable. Guarding the assignment here keeps the swap atomic relative to
+// other state-mutex holders; the BLE-side reads remain unguarded for latency
+// reasons but only see whole-function-object publishes.
 void BluetoothHIDManager::setInputCallback(std::function<void(uint16_t)> callback) {
+  StateLock lock(_stateMutex);
   _inputCallback = callback;
   LOG_DBG("BT", "Input callback registered");
 }
 
 void BluetoothHIDManager::setLearnInputCallback(std::function<void(uint8_t, uint8_t)> callback) {
+  StateLock lock(_stateMutex);
+  const bool wasLearning = (_learnInputCallback != nullptr);
+  const bool nowLearning = (callback != nullptr);
   _learnInputCallback = callback;
-  LOG_DBG("BT", "Learn input callback registered");
+
+  // When entering learn mode, force-release any virtual button currently held
+  // via BLE injection. Otherwise a button held when the wizard opened would
+  // stay "pressed" while the press-side injection is suppressed below, leaving
+  // the activity to consume a phantom press.
+  if (!wasLearning && nowLearning) {
+    for (auto& dev : _connectedDevices) {
+      if (_buttonInjector && dev.activeInjectedButton != 0xFF) {
+        _buttonInjector(dev.activeInjectedButton, false);
+        dev.activeInjectedButton = 0xFF;
+      }
+    }
+  }
+
+  LOG_DBG("BT", "Learn input callback %s", nowLearning ? "registered" : "cleared");
 }
 
 void BluetoothHIDManager::setButtonInjector(std::function<void(uint8_t, bool)> injector) {
+  StateLock lock(_stateMutex);
   _buttonInjector = injector;
   LOG_DBG("BT", "Button injector registered");
 }
 
 void BluetoothHIDManager::setReaderContextCallback(std::function<bool()> callback) {
+  StateLock lock(_stateMutex);
   _readerContextCallback = callback;
   LOG_DBG("BT", "Reader context callback registered");
 }
 
 void BluetoothHIDManager::setButtonActivityNotifier(std::function<void(uint8_t)> notifier) {
+  StateLock lock(_stateMutex);
   _buttonActivityNotifier = notifier;
 }
 
-void BluetoothHIDManager::setBondedDevice(const std::string& address, const std::string& name) {
+void BluetoothHIDManager::setBondedDevice(const std::string& address, const std::string& name, uint8_t addrType) {
+  StateLock lock(_stateMutex);
   _bondedDeviceAddress = address;
   _bondedDeviceName = name;
-  LOG_INF("BT", "Bonded device set: %s (%s)", _bondedDeviceAddress.c_str(), _bondedDeviceName.c_str());
+  _bondedDeviceAddrType = addrType;
+  LOG_INF("BT", "Bonded device set: %s type=%u (%s)", _bondedDeviceAddress.c_str(), addrType,
+          _bondedDeviceName.c_str());
 }
 
 bool BluetoothHIDManager::hasRecentActivity() const {
   // Check if any connected device has had activity in the last 4 minutes
   // This prevents power sleep while using BLE controller
   unsigned long now = millis();
+  StateLock lock(_stateMutex);
   for (const auto& device : _connectedDevices) {
     if (device.lastActivityTime > 0) {
       unsigned long timeSinceActivity = now - device.lastActivityTime;
@@ -740,6 +1209,7 @@ bool BluetoothHIDManager::hasRecentActivity() const {
 
 bool BluetoothHIDManager::hadRecentFree2Input(unsigned long windowMs) const {
   const unsigned long now = millis();
+  StateLock lock(_stateMutex);
   for (const auto& device : _connectedDevices) {
     if (device.lastNormalizedEventMs == 0 || (now - device.lastNormalizedEventMs) > windowMs) {
       continue;
@@ -757,17 +1227,22 @@ bool BluetoothHIDManager::hadRecentFree2Input(unsigned long windowMs) const {
 // Static callback for HID notifications
 void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
   if (!g_instance || !pData || length == 0) return;
-  
+
   // Get the device address and find the connected device
+  std::string deviceAddr;
   ConnectedDevice* device = nullptr;
   if (pChar && pChar->getRemoteService()) {
     auto client = pChar->getRemoteService()->getClient();
     if (client) {
-      std::string deviceAddr = client->getPeerAddress().toString();
-      device = g_instance->findConnectedDevice(deviceAddr);
+      deviceAddr = client->getPeerAddress().toString();
     }
   }
-  
+
+  if (deviceAddr.empty()) return;
+
+  StateLock lock(g_instance->_stateMutex);
+  device = g_instance->findConnectedDevice(deviceAddr);
+
   if (!device) return;
 
   const unsigned long nowMs = millis();
@@ -795,7 +1270,7 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       LOG_DBG("BT", "Game Brick: cleared stale held state after %lu ms idle", nowMs - device->lastNormalizedEventMs);
     }
   }
-  
+
   // Update activity timestamp to keep connection alive
   device->lastActivityTime = millis();
   // Only Free2 needs hold-time capping based on BLE activity. Other remotes,
@@ -826,18 +1301,18 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
     device->pendingGameBrickKeycode = 0x00;
     device->pendingGameBrickButton = 0xFF;
   };
-  
+
   // Extract keycode based on device profile or auto-detect
   uint8_t keycode = 0xFF;
   uint8_t keycodeIndex = 0xFF;
   bool isPressed = false;
   bool isGameBrickProfile = false;
-  
+
   if (length < 1) {
     LOG_DBG("BT", "HID report empty, ignoring");
     return;
   }
-  
+
   // Determine keycode source and press state based on device profile
   if (device->profile) {
     // Use device profile's byte index for keycode
@@ -857,6 +1332,19 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       for (size_t bi = 0; bi < length && bi < 8; bi++) {
         const uint8_t b = pData[bi];
         if (b == device->profile->pageUpCode || b == device->profile->pageDownCode) {
+          // Release-ramp packets from this remote contain the *opposite* learned code at
+          // byte[3] as a transition artifact (e.g. press 0x10, ramp emits 0x20).
+          // If a button is already held and we find a different code, this is a ramp
+          // artifact — ignore it so it falls through as 0x00 and triggers a clean release,
+          // preventing both double-fire and the subsequent silent-drop on the next press.
+          // Exception: during learn mode the wizard relies on seeing the ramp code to
+          // auto-learn the second button from a single physical press.
+          const bool isLearning = (g_instance->_learnInputCallback != nullptr);
+          if (!isLearning && device->lastButtonState && b != device->lastHIDKeycode) {
+            LOG_DBG("BT", "Custom profile: ignoring cross-code 0x%02X while 0x%02X held (release ramp)",
+                    b, device->lastHIDKeycode);
+            break;
+          }
           keycode = b;
           keycodeIndex = static_cast<uint8_t>(bi);
           LOG_DBG("BT", "Custom profile: found learned code 0x%02X at byte[%u] (vs fixed idx %u)",
@@ -1118,7 +1606,7 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
   if (!isPressed && !device->hasSeenRelease) {
     device->hasSeenRelease = true;
   }
-  
+
   // Ignore if no valid keycode detected
   if (keycode == 0x00 || keycode == 0xFF) {
     releaseInjectedButton();
@@ -1128,7 +1616,7 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
     device->lastNormalizedDirection = 0xFF;
     return;
   }
-  
+
   // CRITICAL GATE: Don't inject any buttons until we've seen the first release
   // This prevents startup transient noise from being interpreted as button presses
   if (!device->hasSeenRelease) {
@@ -1200,7 +1688,7 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
     if (g_instance->_learnInputCallback && keycode != 0x00 && keycode != 0xFF && keycodeIndex != 0xFF) {
       g_instance->_learnInputCallback(keycode, keycodeIndex);
     }
-    
+
     // Also call original callback if set
     if (g_instance->_inputCallback) {
       g_instance->_inputCallback(keycode);
@@ -1315,7 +1803,14 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       releaseInjectedButton();
     }
 
-    if (g_instance->_buttonInjector && device->activeInjectedButton == 0xFF) {
+    // While the learn wizard is active, route presses to the learn callback only
+    // and skip virtual-button injection. This prevents a previously-mapped BLE
+    // button (e.g. the device's own Cancel key bound to BTN_BACK from a prior
+    // learning) from also firing the activity's physical-button handler and
+    // canceling the wizard mid-capture.
+    const bool suppressForLearn = (g_instance->_learnInputCallback != nullptr);
+
+    if (g_instance->_buttonInjector && device->activeInjectedButton == 0xFF && !suppressForLearn) {
       if (isGameBrickProfile && device->lastInjectedKeycode == keycode &&
           (millis() - device->lastInjectionTime) < 180) {
         LOG_DBG("BT", "Game Brick: debouncing duplicate key 0x%02X (%lu ms)", keycode,
@@ -1359,7 +1854,7 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       }
     }
   }
-  
+
   // Track the button state and keycode for next time
   device->lastButtonState = isPressed;
   device->lastHIDKeycode = keycode;
@@ -1378,23 +1873,23 @@ uint16_t BluetoothHIDManager::parseHIDReport(uint8_t* data, size_t length) {
     LOG_ERR("BT", "Invalid HID report length: %d", length);
     return 0;
   }
-  
+
   uint8_t modifier = data[0];
   uint8_t keycode = data[2]; // First key in the report
-  
+
   // If no key pressed (all zeros), return 0
   if (keycode == 0 && modifier == 0) {
     return 0;
   }
-  
+
   // Log non-empty reports only during active debug capture to keep the hot path light.
   if (_debugCaptureEnabled) {
     LOG_INF("BT", "HID Report: mod=0x%02X key=0x%02X", modifier, keycode);
   }
-  
+
   // Combine modifier and keycode (modifier in upper byte, keycode in lower)
   uint16_t combined = (static_cast<uint16_t>(modifier) << 8) | keycode;
-  
+
   return combined;
 }
 
@@ -1408,7 +1903,7 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
   if (keycode != 0x00) {
     LOG_DBG("BT", "mapKeycodeToButton() called with keycode: 0x%02X", keycode);
   }
-  
+
   // If we have a device profile, ONLY map keycodes specific to that profile
   if (profile) {
     // Free 2 reports a rolling keycode family while button is held.
@@ -1500,6 +1995,18 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
       return HalGPIO::BTN_DOWN;
     }
 
+    // Optional learned menu-action codes on the profile itself (only honored when
+    // populated — defaults are 0x00). This path is hit when the active profile
+    // pointer is the user-learned custom profile.
+    if (profile->confirmCode != 0x00 && keycode == profile->confirmCode) {
+      LOG_INF("BT", "Matched profile confirmCode 0x%02X -> BTN_CONFIRM", keycode);
+      return HalGPIO::BTN_CONFIRM;
+    }
+    if (profile->cancelCode != 0x00 && keycode == profile->cancelCode) {
+      LOG_INF("BT", "Matched profile cancelCode 0x%02X -> BTN_BACK", keycode);
+      return HalGPIO::BTN_BACK;
+    }
+
     // The known profile didn't recognise this keycode. For non-strict (standard layout)
     // profiles, also consult the user-learned custom mapping as a fallback. This covers
     // the common case where a device partially matches a known profile (e.g. its back
@@ -1514,6 +2021,14 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
         if (keycode == learned->pageDownCode) {
           LOG_INF("BT", "Custom-fallback: 0x%02X -> PageForward (profile=%s)", keycode, profile->name);
           return HalGPIO::BTN_DOWN;
+        }
+        if (learned->confirmCode != 0x00 && keycode == learned->confirmCode) {
+          LOG_INF("BT", "Custom-fallback: 0x%02X -> BTN_CONFIRM (profile=%s)", keycode, profile->name);
+          return HalGPIO::BTN_CONFIRM;
+        }
+        if (learned->cancelCode != 0x00 && keycode == learned->cancelCode) {
+          LOG_INF("BT", "Custom-fallback: 0x%02X -> BTN_BACK (profile=%s)", keycode, profile->name);
+          return HalGPIO::BTN_BACK;
         }
       }
     }
@@ -1537,6 +2052,18 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
         LOG_INF("BT", "Mapped learned key 0x%02X -> PageForward", keycode);
       }
       return HalGPIO::BTN_DOWN;
+    }
+    if (customProfile->confirmCode != 0x00 && keycode == customProfile->confirmCode) {
+      if (_debugCaptureEnabled) {
+        LOG_INF("BT", "Mapped learned key 0x%02X -> BTN_CONFIRM", keycode);
+      }
+      return HalGPIO::BTN_CONFIRM;
+    }
+    if (customProfile->cancelCode != 0x00 && keycode == customProfile->cancelCode) {
+      if (_debugCaptureEnabled) {
+        LOG_INF("BT", "Mapped learned key 0x%02X -> BTN_BACK", keycode);
+      }
+      return HalGPIO::BTN_BACK;
     }
   }
 
@@ -1586,6 +2113,17 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
     if (keycode == device->simpleBackKeycode) {
       return HalGPIO::BTN_UP;
     }
+
+    // Optional learned menu-action keycodes for per-device profiles. Only honored
+    // when populated; auto-learning is reserved for the two page-nav buttons.
+    if (device->simpleConfirmKeycode != 0x00 && keycode == device->simpleConfirmKeycode) {
+      LOG_INF("BT", "Per-device learned key 0x%02X -> BTN_CONFIRM", keycode);
+      return HalGPIO::BTN_CONFIRM;
+    }
+    if (device->simpleCancelKeycode != 0x00 && keycode == device->simpleCancelKeycode) {
+      LOG_INF("BT", "Per-device learned key 0x%02X -> BTN_BACK", keycode);
+      return HalGPIO::BTN_BACK;
+    }
   }
 
   LOG_DBG("BT", "Unmapped keycode: 0x%02X (no profile)", keycode);
@@ -1594,76 +2132,79 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
 
 void BluetoothHIDManager::updateActivity() {
   unsigned long now = millis();
-
-  for (auto& device : _connectedDevices) {
-    if (device.pendingGameBrickRelease && device.pendingGameBrickReleaseMs > 0 && now >= device.pendingGameBrickReleaseMs) {
-      if (_buttonInjector && device.activeInjectedButton != 0xFF) {
-        _buttonInjector(device.activeInjectedButton, false);
-      }
-      device.activeInjectedButton = 0xFF;
-      device.lastButtonState = false;
-      device.lastHIDKeycode = 0x00;
-      device.lastNormalizedPressed = false;
-      device.pendingGameBrickRelease = false;
-      device.pendingGameBrickReleaseMs = 0;
-      device.pendingGameBrickKeycode = 0x00;
-      device.pendingGameBrickButton = 0xFF;
-      LOG_DBG("BT", "Game Brick: released deferred action button for %s", device.address.c_str());
-    }
-  }
-
-  // Fast path: release stale injected buttons promptly for Free2 only.
-  // Free2 often omits timely release frames; other remotes should keep their prior behavior.
-  for (auto& device : _connectedDevices) {
-    if (isFree2Profile(device.profile) && device.activeInjectedButton != 0xFF) {
-      const bool inReaderContext = _readerContextCallback && _readerContextCallback();
-      const unsigned long staleReleaseMs = inReaderContext ? FREE2_STALE_RELEASE_READER_MS
-                                                           : FREE2_STALE_RELEASE_DEFAULT_MS;
-      if (now - device.lastActivityTime <= staleReleaseMs) {
-        continue;
-      }
-      if (_buttonInjector) {
-        _buttonInjector(device.activeInjectedButton, false);
-      }
-      device.activeInjectedButton = 0xFF;
-      device.lastButtonState = false;
-      device.lastHIDKeycode = 0x00;
-      LOG_DBG("BT", "Released stale injected button for %s", device.address.c_str());
-    }
-  }
-
-  // Slow path: connection maintenance every 10 seconds.
-  if (now - lastMaintenanceCheck < 10000) {
-    return;
-  }
-  lastMaintenanceCheck = now;
-
-  // Preserve the original stale-release maintenance behavior for non-Free2 devices.
-  for (auto& device : _connectedDevices) {
-    if (!isFree2Profile(device.profile) && device.activeInjectedButton != 0xFF && now - device.lastActivityTime > 250) {
-      if (_buttonInjector) {
-        _buttonInjector(device.activeInjectedButton, false);
-      }
-      device.activeInjectedButton = 0xFF;
-      device.lastButtonState = false;
-      device.lastHIDKeycode = 0x00;
-      LOG_DBG("BT", "Released stale injected button for %s", device.address.c_str());
-    }
-  }
-
-  // Check for one inactive connection and disconnect it in-place.
+  const bool inReaderContext = _readerContextCallback && _readerContextCallback();
+  const bool runMaintenance = (now - lastMaintenanceCheck) >= 10000;
   std::string inactiveAddress;
   unsigned long inactiveTimeMs = 0;
-  for (const auto& device : _connectedDevices) {
-    if (device.lastActivityTime == 0) {
-      continue;
+  std::string bondedAddressToConnect;
+  bool bondedFound = false;
+
+  {
+    StateLock lock(_stateMutex);
+    if (runMaintenance) {
+      lastMaintenanceCheck = now;
     }
 
-    unsigned long inactiveTime = now - device.lastActivityTime;
-    if (inactiveTime > INACTIVITY_TIMEOUT_MS) {
-      inactiveAddress = device.address;
-      inactiveTimeMs = inactiveTime;
-      break;
+    // Single pass over connected devices. This is hit from loop(), so keep it tight.
+    for (auto& device : _connectedDevices) {
+      if (device.pendingGameBrickRelease && device.pendingGameBrickReleaseMs > 0 &&
+          now >= device.pendingGameBrickReleaseMs) {
+        if (_buttonInjector && device.activeInjectedButton != 0xFF) {
+          _buttonInjector(device.activeInjectedButton, false);
+        }
+        device.activeInjectedButton = 0xFF;
+        device.lastButtonState = false;
+        device.lastHIDKeycode = 0x00;
+        device.lastNormalizedPressed = false;
+        device.pendingGameBrickRelease = false;
+        device.pendingGameBrickReleaseMs = 0;
+        device.pendingGameBrickKeycode = 0x00;
+        device.pendingGameBrickButton = 0xFF;
+        LOG_DBG("BT", "Game Brick: released deferred action button for %s", device.address.c_str());
+      }
+
+      const bool free2Profile = isFree2Profile(device.profile);
+      if (device.activeInjectedButton != 0xFF) {
+        bool releaseStaleButton = false;
+        if (free2Profile) {
+          // Fast path: Free2 often omits timely release frames.
+          const unsigned long staleReleaseMs = inReaderContext ? FREE2_STALE_RELEASE_READER_MS
+                                                               : FREE2_STALE_RELEASE_DEFAULT_MS;
+          releaseStaleButton = (now - device.lastActivityTime) > staleReleaseMs;
+        } else if (runMaintenance) {
+          // Preserve the original slower stale-release maintenance for non-Free2 devices.
+          releaseStaleButton = (now - device.lastActivityTime) > 250;
+        }
+
+        if (releaseStaleButton) {
+          if (_buttonInjector) {
+            _buttonInjector(device.activeInjectedButton, false);
+          }
+          device.activeInjectedButton = 0xFF;
+          device.lastButtonState = false;
+          device.lastHIDKeycode = 0x00;
+          LOG_DBG("BT", "Released stale injected button for %s", device.address.c_str());
+        }
+      }
+
+      if (runMaintenance && inactiveAddress.empty() && device.lastActivityTime != 0) {
+        const unsigned long inactiveTime = now - device.lastActivityTime;
+        if (inactiveTime > INACTIVITY_TIMEOUT_MS) {
+          inactiveAddress = device.address;
+          inactiveTimeMs = inactiveTime;
+        }
+      }
+    }
+
+    // Handle auto-reconnect from scan results without blocking the UI task.
+    if (runMaintenance && _scanning && _connectedDevices.empty() && !_bondedDeviceAddress.empty()) {
+      for (const auto& dev : _discoveredDevices) {
+        if (dev.address == _bondedDeviceAddress) {
+          bondedFound = true;
+          bondedAddressToConnect = _bondedDeviceAddress;
+          break;
+        }
+      }
     }
   }
 
@@ -1671,38 +2212,56 @@ void BluetoothHIDManager::updateActivity() {
     LOG_INF("BT", "Device %s inactive for %lu ms, disconnecting", inactiveAddress.c_str(), inactiveTimeMs);
     disconnectFromDevice(inactiveAddress);
   }
+
+  if (bondedFound) {
+    LOG_INF("BT", "Bonded device %s found in scan, auto-connecting...", bondedAddressToConnect.c_str());
+    stopScan();
+    connectToDevice(bondedAddressToConnect);
+  }
 }
 
 void BluetoothHIDManager::checkAutoReconnect(bool userInputDetected) {
-  if (!_enabled) {
+  if (!isEnabled()) {
     return;
   }
 
   static unsigned long lastReconnectCheck = 0;
   static unsigned long lastReconnectAttempt = 0;
   unsigned long now = millis();
-  
+
   // Only check every 5 seconds to avoid hammering
   if (now - lastReconnectCheck < 5000) {
     return;
   }
   lastReconnectCheck = now;
 
-  // Remove stale disconnected clients from active list.
-  for (auto it = _connectedDevices.begin(); it != _connectedDevices.end();) {
-    if (!it->client || !it->client->isConnected()) {
-      if (_buttonInjector && it->activeInjectedButton != 0xFF) {
-        _buttonInjector(it->activeInjectedButton, false);
+  bool hasConnectedDevice = false;
+  bool scanActive = false;
+  std::string bondedDeviceAddress;
+
+  {
+    StateLock lock(_stateMutex);
+
+    // Remove stale disconnected clients from active list.
+    for (auto it = _connectedDevices.begin(); it != _connectedDevices.end();) {
+      if (!it->client || !it->client->isConnected()) {
+        if (_buttonInjector && it->activeInjectedButton != 0xFF) {
+          _buttonInjector(it->activeInjectedButton, false);
+        }
+        LOG_DBG("BT", "Pruning stale disconnected client entry: %s client=%p", it->address.c_str(), it->client);
+        it = _connectedDevices.erase(it);
+      } else {
+        ++it;
       }
-      LOG_DBG("BT", "Pruning stale disconnected client entry: %s client=%p", it->address.c_str(), it->client);
-      it = _connectedDevices.erase(it);
-    } else {
-      ++it;
     }
+
+    hasConnectedDevice = !_connectedDevices.empty();
+    scanActive = _scanning;
+    bondedDeviceAddress = _bondedDeviceAddress;
   }
 
   // Already connected.
-  if (!_connectedDevices.empty()) {
+  if (hasConnectedDevice) {
     LOG_DBG("BT", "AutoReconnect skipped: already connected");
     return;
   }
@@ -1720,18 +2279,16 @@ void BluetoothHIDManager::checkAutoReconnect(bool userInputDetected) {
   }
   lastReconnectAttempt = now;
 
-  if (_bondedDeviceAddress.empty()) {
+  if (bondedDeviceAddress.empty()) {
     LOG_DBG("BT", "AutoReconnect skipped: no bonded device configured");
     return;
   }
 
-  LOG_INF("BT", "Button activity detected while disconnected, reconnecting to bonded device %s",
-          _bondedDeviceAddress.c_str());
+  LOG_INF("BT", "Button activity detected while disconnected, starting scan to find bonded device %s",
+          bondedDeviceAddress.c_str());
 
-  if (connectToDevice(_bondedDeviceAddress)) {
-    LOG_INF("BT", "Reconnected to bonded device %s", _bondedDeviceAddress.c_str());
-  } else {
-    LOG_ERR("BT", "Reconnect to bonded device %s failed: %s", _bondedDeviceAddress.c_str(), lastError.c_str());
+  if (!scanActive) {
+    startScan(10000); // 10 second background scan
   }
 }
 
@@ -1744,4 +2301,3 @@ void BluetoothHIDManager::loadState() {
   LOG_DBG("BT", "Loading state (stub)");
   // Stub: would load paired devices from file
 }
-

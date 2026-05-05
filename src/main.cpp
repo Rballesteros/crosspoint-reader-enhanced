@@ -278,7 +278,8 @@ void setup() {
   btMgr.setButtonInjector([](uint8_t buttonIndex, bool pressed) { gpio.setVirtualButtonState(buttonIndex, pressed); });
   btMgr.setButtonActivityNotifier([](uint8_t buttonIndex) { gpio.updateVirtualButtonActivity(buttonIndex); });
   btMgr.setReaderContextCallback([]() { return gBluetoothReaderContext; });
-  btMgr.setBondedDevice(SETTINGS.bleBondedDeviceAddr, SETTINGS.bleBondedDeviceName);
+  btMgr.setBondedDevice(SETTINGS.bleBondedDeviceAddr, SETTINGS.bleBondedDeviceName,
+                        SETTINGS.bleBondedDeviceAddrType);
   LOG_INF("MAIN", "Bluetooth HID initialized with button injection");
 
   const auto wakeupReason = gpio.getWakeupReason();
@@ -392,6 +393,47 @@ void loop() {
         uint8_t* buf = display.getFrameBuffer();
         logSerial.write(buf, bufferSize);
         logSerial.printf("SCREENSHOT_END\n");
+      } else if (cmd == "BTDEBUG:ON") {
+        btMgr.setDebugCaptureEnabled(true);
+        logSerial.printf("BTDEBUG:ON\n");
+      } else if (cmd == "BTDEBUG:OFF") {
+        btMgr.setDebugCaptureEnabled(false);
+        logSerial.printf("BTDEBUG:OFF\n");
+      } else if (cmd.startsWith("BTSCAN")) {
+        uint32_t scanMs = 30000;
+        const int sep = cmd.indexOf(':');
+        if (sep >= 0) {
+          const uint32_t parsedMs = static_cast<uint32_t>(cmd.substring(sep + 1).toInt());
+          if (parsedMs > 0) {
+            scanMs = parsedMs;
+          }
+        }
+        if (!btMgr.isEnabled()) {
+          btMgr.enable();
+        }
+        btMgr.startScan(scanMs);
+        logSerial.printf("BTSCAN:STARTED:%lu\n", static_cast<unsigned long>(scanMs));
+      } else if (cmd.startsWith("BTCONNECT:")) {
+        String payload = cmd.substring(10);
+        payload.trim();
+
+        bool hasAddrType = false;
+        uint8_t addrType = 0;
+        const int comma = payload.lastIndexOf(',');
+        if (comma > 0) {
+          const String typeStr = payload.substring(comma + 1);
+          payload = payload.substring(0, comma);
+          payload.trim();
+          addrType = static_cast<uint8_t>(typeStr.toInt());
+          hasAddrType = true;
+        }
+
+        if (!btMgr.isEnabled()) {
+          btMgr.enable();
+        }
+        btMgr.setDebugCaptureEnabled(true);
+        const bool ok = btMgr.connectToDevice(std::string(payload.c_str()), addrType, hasAddrType);
+        logSerial.printf("BTCONNECT:%s:%s\n", ok ? "OK" : "FAIL", btMgr.lastError.c_str());
       }
     }
   }
