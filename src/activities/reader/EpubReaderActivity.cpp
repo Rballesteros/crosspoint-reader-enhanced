@@ -80,16 +80,6 @@ void EpubReaderActivity::onEnter() {
       cachedChapterTotalPageCount = data[4] + (data[5] << 8);
     }
   }
-  // We may want a better condition to detect if we are opening for the first time.
-  // This will trigger if the book is re-opened at Chapter 0.
-  if (currentSpineIndex == 0) {
-    int textSpineIndex = epub->getSpineIndexForTextReference();
-    if (textSpineIndex != 0) {
-      currentSpineIndex = textSpineIndex;
-      LOG_DBG("ERS", "Opened for first time, navigating to text reference at index %d", textSpineIndex);
-    }
-  }
-
   // Save current epub as last opened epub and add to recent books
   APP_STATE.openEpubPath = epub->getPath();
   APP_STATE.saveToFile();
@@ -199,7 +189,7 @@ void EpubReaderActivity::loop() {
       restoreSavedPosition();
       return;
     }
-    onGoHome();
+    activityManager.goHome();
     return;
   }
 
@@ -211,7 +201,7 @@ void EpubReaderActivity::loop() {
   // At end of the book, forward button goes home and back button returns to last page
   if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
     if (nextTriggered) {
-      onGoHome();
+      activityManager.goHome();
     } else {
       currentSpineIndex = epub->getSpineItemsCount() - 1;
       nextPageNumber = 0;
@@ -398,7 +388,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::GO_HOME: {
-      onGoHome();
+      activityManager.goHome();
       return;
     }
     case EpubReaderMenuActivity::MenuAction::BLUETOOTH: {
@@ -418,7 +408,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           saveProgress(backupSpine, backupPage, backupPageCount);
         }
       }
-      onGoHome();
+      activityManager.goHome();
       return;
     }
     case EpubReaderMenuActivity::MenuAction::SCREENSHOT: {
@@ -547,7 +537,6 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   requestUpdate();
 }
 
-// TODO: Failure handling
 void EpubReaderActivity::render(RenderLock&& lock) {
   if (!epub) {
     return;
@@ -597,13 +586,18 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
-    section = std::unique_ptr<Section>(new Section(epub, currentSpineIndex, renderer));
+    section = std::make_unique<Section>(epub, currentSpineIndex, renderer);
 
     if (!section->loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                   SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                   viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
                                   SETTINGS.imageRendering)) {
       LOG_DBG("ERS", "Cache not found, building...");
+
+      // Clear font cache before building to free memory for ZIP inflation
+      if (auto* fcm = renderer.getFontCacheManager()) {
+        fcm->clearCache();
+      }
 
       const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
 
@@ -688,17 +682,31 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  static int retryCount = 0;
+
   {
     auto p = section->loadPageFromSectionFile();
     if (!p) {
       LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
       section->clearCache();
       section.reset();
-      requestUpdate();  // Try again after clearing cache
-                        // TODO: prevent infinite loop if the page keeps failing to load for some reason
+      
+      if (retryCount < 3) {
+        retryCount++;
+        requestUpdate();  // Try again after clearing cache
+      } else {
+        LOG_ERR("ERS", "Repeatedly failed to load page - aborting");
+        retryCount = 0;
+        renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_ERROR), true, EpdFontFamily::BOLD);
+        renderStatusBar();
+        renderer.displayBuffer();
+      }
       automaticPageTurnActive = false;
       return;
     }
+    
+    // Reset retry count on success
+    retryCount = 0;
 
     // Collect footnotes from the loaded page
     currentPageFootnotes = std::move(p->footnotes);
@@ -830,14 +838,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto tDisplay = millis();
 
   // Save BW buffer only when the grayscale AA pass needs it. When BLE is connected,
-  // the extra scratch copy can fail under runtime memory pressure; if that happens
-  // we fall back to re-rendering the BW frame after the grayscale overlay so the
-  // next FAST_REFRESH still compares against the correct previous page.
+  // the extra scratch copy can fail under runtime memory pressure; in that case,
+  // keep the already-displayed BW page and skip AA for this render.
   bool bwBufferStored = false;
   if (SETTINGS.textAntiAliasing) {
     bwBufferStored = renderer.storeBwBuffer();
     if (!bwBufferStored) {
-      LOG_ERR("ERS", "AA fallback: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
+      const auto tEnd = millis();
+      LOG_ERR("ERS", "Skipping AA: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
+      LOG_DBG("ERS",
+              "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store_fail=%lums total=%lums",
+              tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - tDisplay, tEnd - t0);
+      return;
     }
   }
   const auto tBwStore = millis();

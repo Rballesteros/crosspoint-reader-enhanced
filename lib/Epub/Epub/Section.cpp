@@ -1,5 +1,7 @@
 #include "Section.h"
 
+#include <FontCacheManager.h>
+#include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -162,6 +164,10 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   for (int attempt = 0; attempt < 3 && !success; attempt++) {
     if (attempt > 0) {
       LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
+      // Attempt to free memory that might be held by the font cache
+      if (auto* fcm = renderer.getFontCacheManager()) {
+        fcm->clearCache();
+      }
       delay(50);  // Brief delay before retry
     }
 

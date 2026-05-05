@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <string_view>
 #include <vector>
 
 #include "Epub.h"
@@ -44,7 +45,7 @@ class ContentOpfParser final : public Print {
   static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
 
   // FNV-1a hash function
-  static uint32_t fnvHash(const std::string& s) {
+  static uint32_t fnvHash(std::string_view s) {
     uint32_t hash = 2166136261u;
     for (char c : s) {
       hash ^= static_cast<uint8_t>(c);

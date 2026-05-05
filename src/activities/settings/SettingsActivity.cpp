@@ -102,7 +102,7 @@ void SettingsActivity::loop() {
       requestUpdate();
     } else {
       SETTINGS.saveToFile();
-      onGoHome();
+      activityManager.goHome();
     }
     return;
   }

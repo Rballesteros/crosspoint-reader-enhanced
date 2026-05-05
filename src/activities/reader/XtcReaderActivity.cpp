@@ -79,7 +79,7 @@ void XtcReaderActivity::loop() {
 
   // Short press BACK goes directly to home
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) && backHeldMs < goHomeMs) {
-    onGoHome();
+    activityManager.goHome();
     return;
   }
 

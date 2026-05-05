@@ -79,7 +79,7 @@ std::string_view stripTrailingImportant(std::string_view value) {
 
 // String utilities implementation
 
-std::string CssParser::normalized(const std::string& s) {
+std::string CssParser::normalized(std::string_view s) {
   std::string result;
   result.reserve(s.size());
 
@@ -103,7 +103,7 @@ std::string CssParser::normalized(const std::string& s) {
   return result;
 }
 
-void CssParser::normalizedInto(const std::string& s, std::string& out) {
+void CssParser::normalizedInto(std::string_view s, std::string& out) {
   out.clear();
   out.reserve(s.size());
 
@@ -125,13 +125,13 @@ void CssParser::normalizedInto(const std::string& s, std::string& out) {
   }
 }
 
-std::vector<std::string> CssParser::splitOnChar(const std::string& s, const char delimiter) {
+std::vector<std::string> CssParser::splitOnChar(std::string_view s, const char delimiter) {
   std::vector<std::string> parts;
   size_t start = 0;
 
   for (size_t i = 0; i <= s.size(); ++i) {
     if (i == s.size() || s[i] == delimiter) {
-      std::string part = s.substr(start, i - start);
+      std::string_view part = s.substr(start, i - start);
       std::string trimmed = normalized(part);
       if (!trimmed.empty()) {
         parts.push_back(trimmed);
@@ -142,7 +142,7 @@ std::vector<std::string> CssParser::splitOnChar(const std::string& s, const char
   return parts;
 }
 
-std::vector<std::string> CssParser::splitWhitespace(const std::string& s) {
+std::vector<std::string> CssParser::splitWhitespace(std::string_view s) {
   std::vector<std::string> parts;
   size_t start = 0;
   bool inWord = false;
@@ -150,7 +150,7 @@ std::vector<std::string> CssParser::splitWhitespace(const std::string& s) {
   for (size_t i = 0; i <= s.size(); ++i) {
     const bool isSpace = i == s.size() || isCssWhitespace(s[i]);
     if (isSpace && inWord) {
-      parts.push_back(s.substr(start, i - start));
+      parts.push_back(std::string(s.substr(start, i - start)));
       inWord = false;
     } else if (!isSpace && !inWord) {
       start = i;
@@ -162,7 +162,7 @@ std::vector<std::string> CssParser::splitWhitespace(const std::string& s) {
 
 // Property value interpreters
 
-CssTextAlign CssParser::interpretAlignment(const std::string& val) {
+CssTextAlign CssParser::interpretAlignment(std::string_view val) {
   const std::string v = normalized(val);
 
   if (v == "left" || v == "start") return CssTextAlign::Left;
@@ -173,14 +173,14 @@ CssTextAlign CssParser::interpretAlignment(const std::string& val) {
   return CssTextAlign::Left;
 }
 
-CssFontStyle CssParser::interpretFontStyle(const std::string& val) {
+CssFontStyle CssParser::interpretFontStyle(std::string_view val) {
   const std::string v = normalized(val);
 
   if (v == "italic" || v == "oblique") return CssFontStyle::Italic;
   return CssFontStyle::Normal;
 }
 
-CssFontWeight CssParser::interpretFontWeight(const std::string& val) {
+CssFontWeight CssParser::interpretFontWeight(std::string_view val) {
   const std::string v = normalized(val);
 
   // Named values
@@ -201,7 +201,7 @@ CssFontWeight CssParser::interpretFontWeight(const std::string& val) {
   return CssFontWeight::Normal;
 }
 
-CssTextDecoration CssParser::interpretDecoration(const std::string& val) {
+CssTextDecoration CssParser::interpretDecoration(std::string_view val) {
   const std::string v = normalized(val);
 
   // text-decoration can have multiple space-separated values
@@ -211,13 +211,13 @@ CssTextDecoration CssParser::interpretDecoration(const std::string& val) {
   return CssTextDecoration::None;
 }
 
-CssLength CssParser::interpretLength(const std::string& val) {
+CssLength CssParser::interpretLength(std::string_view val) {
   CssLength result;
   tryInterpretLength(val, result);
   return result;
 }
 
-bool CssParser::tryInterpretLength(const std::string& val, CssLength& out) {
+bool CssParser::tryInterpretLength(std::string_view val, CssLength& out) {
   const std::string v = normalized(val);
   if (v.empty()) {
     out = CssLength{};
@@ -260,10 +260,10 @@ bool CssParser::tryInterpretLength(const std::string& val, CssLength& out) {
 
 // Declaration parsing
 
-void CssParser::parseDeclarationIntoStyle(const std::string& decl, CssStyle& style, std::string& propNameBuf,
+void CssParser::parseDeclarationIntoStyle(std::string_view decl, CssStyle& style, std::string& propNameBuf,
                                           std::string& propValueBuf) {
   const size_t colonPos = decl.find(':');
-  if (colonPos == std::string::npos || colonPos == 0) return;
+  if (colonPos == std::string_view::npos || colonPos == 0) return;
 
   normalizedInto(decl.substr(0, colonPos), propNameBuf);
   normalizedInto(decl.substr(colonPos + 1), propValueBuf);
@@ -347,7 +347,7 @@ void CssParser::parseDeclarationIntoStyle(const std::string& decl, CssStyle& sty
   }
 }
 
-CssStyle CssParser::parseDeclarations(const std::string& declBlock) {
+CssStyle CssParser::parseDeclarations(std::string_view declBlock) {
   CssStyle style;
   std::string propNameBuf;
   std::string propValueBuf;
@@ -357,7 +357,7 @@ CssStyle CssParser::parseDeclarations(const std::string& declBlock) {
     if (i == declBlock.size() || declBlock[i] == ';') {
       if (i > start) {
         const size_t len = i - start;
-        std::string decl = declBlock.substr(start, len);
+        std::string_view decl = declBlock.substr(start, len);
         if (!decl.empty()) {
           parseDeclarationIntoStyle(decl, style, propNameBuf, propValueBuf);
         }
@@ -371,7 +371,7 @@ CssStyle CssParser::parseDeclarations(const std::string& declBlock) {
 
 // Rule processing
 
-void CssParser::processRuleBlockWithStyle(const std::string& selectorGroup, const CssStyle& style) {
+void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const CssStyle& style) {
   // Check if we've reached the rule limit before processing
   if (rulesBySelector_.size() >= MAX_RULES) {
     LOG_DBG("CSS", "Reached max rules limit (%zu), stopping CSS parsing", MAX_RULES);
@@ -392,15 +392,34 @@ void CssParser::processRuleBlockWithStyle(const std::string& selectorGroup, cons
     std::string key = normalized(sel);
     if (key.empty()) continue;
 
-    // TODO: Consider adding support for sibling css selectors in the future
-    // Ensure no + in selector as we don't support adjacent CSS selectors for now
-    if (key.find('+') != std::string_view::npos) {
-      continue;
-    }
+    // Advanced Selector Support
+    // To support complex selectors like "div > p", "div + p", or "div ~ p", 
+    // we isolate the right-most (target) element and apply the style to it.
+    // While this applies the style broadly (ignoring the hierarchy constraint),
+    // it ensures that heavily stylized EPUBs do not completely lose formatting 
+    // for standard layout elements.
 
-    // TODO: Consider adding support for direct nested css selectors in the future
-    // Ensure no > in selector as we don't support nested CSS selectors for now
-    if (key.find('>') != std::string_view::npos) {
+    size_t lastCombinator = key.find_last_of(">+~ ");
+    if (lastCombinator != std::string::npos) {
+      // Skip the combinator itself
+      size_t targetStart = lastCombinator + 1;
+      // If the combinator was a space, there might be multiple spaces, so skip them
+      while (targetStart < key.size() && isCssWhitespace(key[targetStart])) {
+        targetStart++;
+      }
+      
+      if (targetStart < key.size()) {
+        std::string targetElement = key.substr(targetStart);
+        if (!targetElement.empty()) {
+          auto existing = rulesBySelector_.find(targetElement);
+          if (existing != rulesBySelector_.end()) {
+            existing->second.applyOver(style);
+          } else {
+            rulesBySelector_[targetElement] = style;
+          }
+        }
+      }
+      // We skip the original key so we don't save the full unparsed path
       continue;
     }
 
@@ -422,23 +441,9 @@ void CssParser::processRuleBlockWithStyle(const std::string& selectorGroup, cons
       continue;
     }
 
-    // TODO: Consider adding support for general sibling combinator selectors in the future
-    // Ensure no ~ in selector as we don't support general sibling combinator CSS selectors for now
-    if (key.find('~') != std::string_view::npos) {
-      continue;
-    }
-
     // TODO: Consider adding support for wildcard css selectors in the future
     // Ensure no * in selector as we don't support wildcard CSS selectors for now
     if (key.find('*') != std::string_view::npos) {
-      continue;
-    }
-
-    // TODO: Add support for more complex selectors in the future
-    // At the moment, we only ever check for `tag`, `tag.class1` or `.class1`
-    // If the selector has whitespace in it, then it's either a CSS selector for a descendant element (e.g. `tag1 tag2`)
-    // or some other slightly more advanced CSS selector which we don't support yet
-    if (key.find(' ') != std::string_view::npos) {
       continue;
     }
 
@@ -608,7 +613,7 @@ bool CssParser::loadFromStream(FsFile& source) {
 
 // Style resolution
 
-CssStyle CssParser::resolveStyle(const std::string& tagName, const std::string& classAttr) const {
+CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view classAttr) const {
   static bool lowHeapWarningLogged = false;
   if (ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_CSS) {
     if (!lowHeapWarningLogged) {
@@ -658,7 +663,7 @@ CssStyle CssParser::resolveStyle(const std::string& tagName, const std::string& 
 
 // Inline style parsing (static - doesn't need rule database)
 
-CssStyle CssParser::parseInlineStyle(const std::string& styleValue) { return parseDeclarations(styleValue); }
+CssStyle CssParser::parseInlineStyle(std::string_view styleValue) { return parseDeclarations(styleValue); }
 
 // Cache serialization
 

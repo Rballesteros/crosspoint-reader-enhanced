@@ -83,19 +83,19 @@ constexpr const char* SKIP_TAGS[] = {"head"};
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
 
-bool matches(const char* tag_name, const char* const* possible_tags, size_t count) {
+bool matches(std::string_view tag_name, const char* const* possible_tags, size_t count) {
   for (size_t i = 0; i < count; i++) {
-    if (strcmp(tag_name, possible_tags[i]) == 0) {
+    if (tag_name == possible_tags[i]) {
       return true;
     }
   }
   return false;
 }
 
-const char* getAttribute(const XML_Char** atts, const char* attrName) {
+const char* getAttribute(const XML_Char** atts, std::string_view attrName) {
   if (!atts) return nullptr;
   for (int i = 0; atts[i]; i += 2) {
-    if (strcmp(atts[i], attrName) == 0) return atts[i + 1];
+    if (attrName == atts[i]) return atts[i + 1];
   }
   return nullptr;
 }
@@ -194,7 +194,7 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
     anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
     pendingAnchorId.clear();
   }
-  currentTextBlock.reset(new ParsedText(extraParagraphSpacing, hyphenationEnabled, blockStyle));
+  currentTextBlock = std::make_unique<ParsedText>(extraParagraphSpacing, hyphenationEnabled, blockStyle);
   wordsExtractedInBlock = 0;
 }
 
@@ -497,14 +497,14 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                      self->viewportHeight)) {
                   self->completePageFn(std::move(self->currentPage), self->xpathParagraphIndex);
                   self->completedPageCount++;
-                  self->currentPage.reset(new Page());
+                  self->currentPage = std::make_unique<Page>();
                   if (!self->currentPage) {
                     LOG_ERR("EHP", "Failed to create new page");
                     return;
                   }
                   self->currentPageNextY = 0;
                 } else if (!self->currentPage) {
-                  self->currentPage.reset(new Page());
+                  self->currentPage = std::make_unique<Page>();
                   if (!self->currentPage) {
                     LOG_ERR("EHP", "Failed to create initial page");
                     return;
@@ -1176,14 +1176,14 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
 
   if (!currentPage) {
-    currentPage.reset(new Page());
+    currentPage = std::make_unique<Page>();
     currentPageNextY = 0;
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
     completePageFn(std::move(currentPage), xpathParagraphIndex);
     completedPageCount++;
-    currentPage.reset(new Page());
+    currentPage = std::make_unique<Page>();
     currentPageNextY = 0;
   }
 
@@ -1209,7 +1209,7 @@ void ChapterHtmlSlimParser::makePages() {
   }
 
   if (!currentPage) {
-    currentPage.reset(new Page());
+    currentPage = std::make_unique<Page>();
     currentPageNextY = 0;
   }
 

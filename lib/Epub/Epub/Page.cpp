@@ -22,7 +22,7 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
   serialization::readPod(file, yPos);
 
   auto tb = TextBlock::deserialize(file);
-  return std::unique_ptr<PageLine>(new PageLine(std::move(tb), xPos, yPos));
+  return std::make_unique<PageLine>(std::move(tb), xPos, yPos);
 }
 
 void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
@@ -45,7 +45,7 @@ std::unique_ptr<PageImage> PageImage::deserialize(FsFile& file) {
   serialization::readPod(file, yPos);
 
   auto ib = ImageBlock::deserialize(file);
-  return std::unique_ptr<PageImage>(new PageImage(std::move(ib), xPos, yPos));
+  return std::make_unique<PageImage>(std::move(ib), xPos, yPos);
 }
 
 void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
@@ -83,7 +83,7 @@ bool Page::serialize(FsFile& file) const {
 }
 
 std::unique_ptr<Page> Page::deserialize(FsFile& file) {
-  auto page = std::unique_ptr<Page>(new Page());
+  auto page = std::make_unique<Page>();
 
   uint16_t count;
   serialization::readPod(file, count);

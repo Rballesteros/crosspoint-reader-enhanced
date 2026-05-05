@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <string_view>
 
 #include "../Activity.h"
 #include "activities/home/FileBrowserActivity.h"
@@ -14,9 +15,9 @@ class ReaderActivity final : public Activity {
   static std::unique_ptr<Epub> loadEpub(const std::string& path);
   static std::unique_ptr<Xtc> loadXtc(const std::string& path);
   static std::unique_ptr<Txt> loadTxt(const std::string& path);
-  static bool isXtcFile(const std::string& path);
-  static bool isTxtFile(const std::string& path);
-  static bool isBmpFile(const std::string& path);
+  static bool isXtcFile(std::string_view path);
+  static bool isTxtFile(std::string_view path);
+  static bool isBmpFile(std::string_view path);
 
   void goToLibrary(const std::string& fromBookPath = "");
   void onGoToEpubReader(std::unique_ptr<Epub> epub);

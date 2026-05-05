@@ -20,28 +20,30 @@ constexpr char SOFT_HYPHEN_UTF8[] = "\xC2\xAD";
 constexpr size_t SOFT_HYPHEN_BYTES = 2;
 
 // Returns the first rendered codepoint of a word (skipping leading soft hyphens).
-uint32_t firstCodepoint(const std::string& word) {
-  const auto* ptr = reinterpret_cast<const unsigned char*>(word.c_str());
-  while (true) {
-    const uint32_t cp = utf8NextCodepoint(&ptr);
+uint32_t firstCodepoint(std::string_view word) {
+  while (!word.empty()) {
+    std::string_view nextSv = word;
+    const uint32_t cp = utf8NextCodepoint(nextSv);
     if (cp == 0) return 0;
     if (cp != 0x00AD) return cp;  // skip soft hyphens
+    word = nextSv;
   }
+  return 0;
 }
 
 // Returns the last codepoint of a word by scanning backward for the start of the last UTF-8 sequence.
-uint32_t lastCodepoint(const std::string& word) {
+uint32_t lastCodepoint(std::string_view word) {
   if (word.empty()) return 0;
   // UTF-8 continuation bytes start with 10xxxxxx; scan backward to find the leading byte.
   size_t i = word.size() - 1;
   while (i > 0 && (static_cast<uint8_t>(word[i]) & 0xC0) == 0x80) {
     --i;
   }
-  const auto* ptr = reinterpret_cast<const unsigned char*>(word.c_str() + i);
-  return utf8NextCodepoint(&ptr);
+  std::string_view lastCharSv = word.substr(i);
+  return utf8NextCodepoint(lastCharSv);
 }
 
-bool containsSoftHyphen(const std::string& word) { return word.find(SOFT_HYPHEN_UTF8) != std::string::npos; }
+bool containsSoftHyphen(std::string_view word) { return word.find(SOFT_HYPHEN_UTF8) != std::string_view::npos; }
 
 // Removes every soft hyphen in-place so rendered glyphs match measured widths.
 void stripSoftHyphensInPlace(std::string& word) {
@@ -54,24 +56,24 @@ void stripSoftHyphensInPlace(std::string& word) {
 // Returns the advance width for a word while ignoring soft hyphen glyphs and optionally appending a visible hyphen.
 // Uses advance width (sum of glyph advances + kerning) rather than bounding box width so that italic glyph overhangs
 // don't inflate inter-word spacing.
-uint16_t measureWordWidth(const GfxRenderer& renderer, const int fontId, const std::string& word,
+uint16_t measureWordWidth(const GfxRenderer& renderer, const int fontId, std::string_view word,
                           const EpdFontFamily::Style style, const bool appendHyphen = false) {
   if (word.size() == 1 && word[0] == ' ' && !appendHyphen) {
     return renderer.getSpaceWidth(fontId, style);
   }
   const bool hasSoftHyphen = containsSoftHyphen(word);
   if (!hasSoftHyphen && !appendHyphen) {
-    return renderer.getTextAdvanceX(fontId, word.c_str(), style);
+    return renderer.getTextAdvanceX(fontId, word, style);
   }
 
-  std::string sanitized = word;
+  std::string sanitized(word);
   if (hasSoftHyphen) {
     stripSoftHyphensInPlace(sanitized);
   }
   if (appendHyphen) {
     sanitized.push_back('-');
   }
-  return renderer.getTextAdvanceX(fontId, sanitized.c_str(), style);
+  return renderer.getTextAdvanceX(fontId, sanitized, style);
 }
 
 }  // namespace

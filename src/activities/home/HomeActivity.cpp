@@ -139,17 +139,12 @@ bool HomeActivity::storeCoverBuffer() {
   freeCoverBuffer();
 
   const size_t bufferSize = renderer.getBufferSize();
-  coverBuffer = static_cast<uint8_t*>(malloc(bufferSize));
-  if (!coverBuffer) {
-    return false;
-  }
-
-  memcpy(coverBuffer, frameBuffer, bufferSize);
+  coverBuffer.assign(frameBuffer, frameBuffer + bufferSize);
   return true;
 }
 
 bool HomeActivity::restoreCoverBuffer() {
-  if (!coverBuffer) {
+  if (coverBuffer.empty()) {
     return false;
   }
 
@@ -158,16 +153,13 @@ bool HomeActivity::restoreCoverBuffer() {
     return false;
   }
 
-  const size_t bufferSize = renderer.getBufferSize();
-  memcpy(frameBuffer, coverBuffer, bufferSize);
+  memcpy(frameBuffer, coverBuffer.data(), coverBuffer.size());
   return true;
 }
 
 void HomeActivity::freeCoverBuffer() {
-  if (coverBuffer) {
-    free(coverBuffer);
-    coverBuffer = nullptr;
-  }
+  coverBuffer.clear();
+  coverBuffer.shrink_to_fit();
   coverBufferStored = false;
 }
 
@@ -195,7 +187,7 @@ void HomeActivity::loop() {
     const int settingsIdx = idx;
 
     if (selectorIndex < recentBooks.size()) {
-      onSelectBook(recentBooks[selectorIndex].path);
+      activityManager.goToReader(recentBooks[selectorIndex].path);
     } else if (menuSelectedIndex == fileBrowserIdx) {
       onFileBrowserOpen();
     } else if (menuSelectedIndex == recentsIdx) {
@@ -265,7 +257,7 @@ void HomeActivity::render(RenderLock&&) {
   }
 }
 
-void HomeActivity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
+
 
 void HomeActivity::onFileBrowserOpen() { activityManager.goToFileBrowser(); }
 

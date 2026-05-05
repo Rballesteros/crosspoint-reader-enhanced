@@ -233,7 +233,7 @@ void FileBrowserActivity::loop() {
         selectorIndex = 0;
         requestUpdate();
       } else {
-        onSelectBook(basepath + entry);
+        activityManager.goToReader(basepath + entry);
       }
     }
     return;
@@ -261,7 +261,7 @@ void FileBrowserActivity::loop() {
         setResult(std::move(res));
         finish();
       } else {
-        onGoHome();
+        activityManager.goHome();
       }
     }
   }

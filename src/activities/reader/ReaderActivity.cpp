@@ -13,14 +13,14 @@
 #include "activities/util/BmpViewerActivity.h"
 #include "activities/util/FullScreenMessageActivity.h"
 
-bool ReaderActivity::isXtcFile(const std::string& path) { return FsHelpers::hasXtcExtension(path); }
+bool ReaderActivity::isXtcFile(std::string_view path) { return FsHelpers::hasXtcExtension(path); }
 
-bool ReaderActivity::isTxtFile(const std::string& path) {
+bool ReaderActivity::isTxtFile(std::string_view path) {
   return FsHelpers::hasTxtExtension(path) ||
          FsHelpers::hasMarkdownExtension(path);  // Treat .md as txt files (until we have a markdown reader)
 }
 
-bool ReaderActivity::isBmpFile(const std::string& path) { return FsHelpers::hasBmpExtension(path); }
+bool ReaderActivity::isBmpFile(std::string_view path) { return FsHelpers::hasBmpExtension(path); }
 
 std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
   if (!Storage.exists(path.c_str())) {
@@ -28,7 +28,7 @@ std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
     return nullptr;
   }
 
-  auto epub = std::unique_ptr<Epub>(new Epub(path, "/.crosspoint"));
+  auto epub = std::make_unique<Epub>(path, "/.crosspoint");
   if (epub->load(true, SETTINGS.embeddedStyle == 0)) {
     return epub;
   }
@@ -43,7 +43,7 @@ std::unique_ptr<Xtc> ReaderActivity::loadXtc(const std::string& path) {
     return nullptr;
   }
 
-  auto xtc = std::unique_ptr<Xtc>(new Xtc(path, "/.crosspoint"));
+  auto xtc = std::make_unique<Xtc>(path, "/.crosspoint");
   if (xtc->load()) {
     return xtc;
   }
@@ -58,7 +58,7 @@ std::unique_ptr<Txt> ReaderActivity::loadTxt(const std::string& path) {
     return nullptr;
   }
 
-  auto txt = std::unique_ptr<Txt>(new Txt(path, "/.crosspoint"));
+  auto txt = std::make_unique<Txt>(path, "/.crosspoint");
   if (txt->load()) {
     return txt;
   }

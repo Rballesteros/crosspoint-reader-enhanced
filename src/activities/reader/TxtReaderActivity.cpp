@@ -67,7 +67,7 @@ void TxtReaderActivity::loop() {
   // Short press BACK goes directly to home
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
-    onGoHome();
+    activityManager.goHome();
     return;
   }
 
@@ -84,7 +84,7 @@ void TxtReaderActivity::loop() {
       currentPage++;
       requestUpdate();
     } else {
-      onGoHome();
+      activityManager.goHome();
     }
   }
 }
@@ -180,14 +180,9 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
 
   // Read a chunk from file
   size_t chunkSize = std::min(CHUNK_SIZE, fileSize - offset);
-  auto* buffer = static_cast<uint8_t*>(malloc(chunkSize + 1));
-  if (!buffer) {
-    LOG_ERR("TRS", "Failed to allocate %zu bytes", chunkSize);
-    return false;
-  }
+  std::vector<uint8_t> buffer(chunkSize + 1);
 
-  if (!txt->readContent(buffer, offset, chunkSize)) {
-    free(buffer);
+  if (!txt->readContent(buffer.data(), offset, chunkSize)) {
     return false;
   }
   buffer[chunkSize] = '\0';
@@ -218,7 +213,7 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
     size_t displayLen = hasCR ? lineContentLen - 1 : lineContentLen;
 
     // Extract line content for display (without CR/LF)
-    std::string line(reinterpret_cast<char*>(buffer + pos), displayLen);
+    std::string line(reinterpret_cast<char*>(&buffer[pos]), displayLen);
 
     // Track position within this source line (in bytes from pos)
     size_t lineBytePos = 0;
@@ -290,8 +285,6 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
   if (nextOffset > fileSize) {
     nextOffset = fileSize;
   }
-
-  free(buffer);
 
   return !outLines.empty();
 }
