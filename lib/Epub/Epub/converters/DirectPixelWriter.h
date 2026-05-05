@@ -136,13 +136,13 @@ struct DirectPixelWriter {
 //
 // Caller guarantees coordinates are within cache bounds.
 struct DirectCacheWriter {
-  uint8_t* buffer;
-  int bytesPerRow;
-  int originX;
-  uint8_t* rowPtr;  // Pre-computed for current row
+  uint8_t* buffer = nullptr;
+  int bytesPerRow = 0;
+  int originX = 0;
+  uint8_t* rowPtr = nullptr;  // Pre-computed for current row
 
-  void init(uint8_t* cacheBuffer, int cacheBytesPerRow, int cacheOriginX) {
-    buffer = cacheBuffer;
+  void init(std::vector<uint8_t>& cacheBuffer, int cacheBytesPerRow, int cacheOriginX) {
+    buffer = cacheBuffer.data();
     bytesPerRow = cacheBytesPerRow;
     originX = cacheOriginX;
     rowPtr = nullptr;
@@ -151,11 +151,11 @@ struct DirectCacheWriter {
   // Call once per row before the column loop.
   inline void beginRow(int screenY, int cacheOriginY) { rowPtr = buffer + (screenY - cacheOriginY) * bytesPerRow; }
 
-  // Write a 2-bit pixel value. No bounds checking.
+  // Must only be called after beginRow().
   inline void writePixel(int screenX, uint8_t value) const {
     const int localX = screenX - originX;
-    const int byteIdx = localX >> 2;            // localX / 4
-    const int bitShift = 6 - (localX & 3) * 2;  // MSB first: pixel 0 at bits 6-7
+    const int byteIdx = localX / 4;
+    const int bitShift = 6 - (localX % 4) * 2;  // MSB first
     rowPtr[byteIdx] = (rowPtr[byteIdx] & ~(0x03 << bitShift)) | ((value & 0x03) << bitShift);
   }
 };

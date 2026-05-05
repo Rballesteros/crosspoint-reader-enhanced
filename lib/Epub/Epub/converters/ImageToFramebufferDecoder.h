@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 class GfxRenderer;
 
@@ -25,9 +26,9 @@ class ImageToFramebufferDecoder {
  public:
   virtual ~ImageToFramebufferDecoder() = default;
 
-  virtual bool decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer, const RenderConfig& config) = 0;
+  virtual bool decodeToFramebuffer(std::string_view imagePath, GfxRenderer& renderer, const RenderConfig& config) = 0;
 
-  virtual bool getDimensions(const std::string& imagePath, ImageDimensions& dims) const = 0;
+  virtual bool getDimensions(std::string_view imagePath, ImageDimensions& dims) const = 0;
 
   virtual const char* getFormatName() const = 0;
 
@@ -35,6 +36,6 @@ class ImageToFramebufferDecoder {
   // Size validation helpers
   static constexpr int MAX_SOURCE_PIXELS = 3145728;  // 2048 * 1536
 
-  bool validateImageDimensions(int width, int height, const std::string& format);
-  void warnUnsupportedFeature(const std::string& feature, const std::string& imagePath);
+  bool validateImageDimensions(int width, int height, std::string_view format);
+  void warnUnsupportedFeature(std::string_view feature, std::string_view imagePath);
 };

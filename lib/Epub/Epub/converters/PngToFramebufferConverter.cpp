@@ -41,13 +41,12 @@ struct PngContext {
 // File I/O callbacks use pFile->fHandle to access the FsFile*,
 // avoiding the need for global file state.
 void* pngOpenWithHandle(const char* filename, int32_t* size) {
-  FsFile* f = new FsFile();
+  auto f = std::make_unique<FsFile>();
   if (!Storage.openFileForRead("PNG", std::string(filename), *f)) {
-    delete f;
     return nullptr;
   }
   *size = f->size();
-  return f;
+  return f.release();
 }
 
 void pngCloseWithHandle(void* handle) {
@@ -237,25 +236,20 @@ int pngDrawCallback(PNGDRAW* pDraw) {
 
 }  // namespace
 
-bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
+bool PngToFramebufferConverter::getDimensionsStatic(std::string_view imagePath, ImageDimensions& out) {
   size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
     LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
     return false;
   }
 
-  PNG* png = new (std::nothrow) PNG();
-  if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder for dimensions");
-    return false;
-  }
+  auto png = std::make_unique<PNG>();
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     nullptr);
+  int rc = png->open(std::string(imagePath).c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle,
+                     pngSeekWithHandle, nullptr);
 
   if (rc != 0) {
     LOG_ERR("PNG", "Failed to open PNG for dimensions: %d", rc);
-    delete png;
     return false;
   }
 
@@ -263,13 +257,12 @@ bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
   out.height = png->getHeight();
 
   png->close();
-  delete png;
   return true;
 }
 
-bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
+bool PngToFramebufferConverter::decodeToFramebuffer(std::string_view imagePath, GfxRenderer& renderer,
                                                     const RenderConfig& config) {
-  LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
+  LOG_DBG("PNG", "Decoding PNG: %.*s", static_cast<int>(imagePath.size()), imagePath.data());
 
   size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
@@ -278,11 +271,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   }
 
   // Heap-allocate PNG decoder (~42 KB) - freed at end of function
-  PNG* png = new (std::nothrow) PNG();
-  if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder");
-    return false;
-  }
+  auto png = std::make_unique<PNG>();
 
   PngContext ctx;
   ctx.renderer = &renderer;
@@ -290,17 +279,15 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     pngDrawCallback);
+  int rc = png->open(std::string(imagePath).c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle,
+                     pngSeekWithHandle, pngDrawCallback);
   if (rc != PNG_SUCCESS) {
     LOG_ERR("PNG", "Failed to open PNG: %d", rc);
-    delete png;
     return false;
   }
 
   if (!validateImageDimensions(png->getWidth(), png->getHeight(), "PNG")) {
     png->close();
-    delete png;
     return false;
   }
 
@@ -336,7 +323,6 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
             requiredInternal, ctx.srcWidth, pixelType, PNG_MAX_BUFFERED_PIXELS);
     LOG_ERR("PNG", "Aborting decode to avoid PNGdec internal buffer overflow");
     png->close();
-    delete png;
     return false;
   }
 
@@ -346,13 +332,8 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
 
   // Allocate grayscale line buffer on demand (~3.2 KB) - freed after decode
   const size_t grayBufSize = PNG_MAX_BUFFERED_PIXELS / 2;
-  ctx.grayLineBuffer = static_cast<uint8_t*>(malloc(grayBufSize));
-  if (!ctx.grayLineBuffer) {
-    LOG_ERR("PNG", "Failed to allocate gray line buffer");
-    png->close();
-    delete png;
-    return false;
-  }
+  std::vector<uint8_t> grayLineBuffer(grayBufSize);
+  ctx.grayLineBuffer = grayLineBuffer.data();
 
   // Allocate cache buffer using SCALED dimensions.
   // PNG decode is fast enough (~135ms for 400x600) that caching provides minimal benefit
@@ -375,18 +356,15 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   rc = png->decode(&ctx, 0);
   unsigned long decodeTime = millis() - decodeStart;
 
-  free(ctx.grayLineBuffer);
   ctx.grayLineBuffer = nullptr;
 
   if (rc != PNG_SUCCESS) {
     LOG_ERR("PNG", "Decode failed: %d", rc);
     png->close();
-    delete png;
     return false;
   }
 
   png->close();
-  delete png;
   LOG_DBG("PNG", "PNG decoding complete - render time: %lu ms", decodeTime);
 
   // Write cache file if caching was enabled and buffer was allocated
@@ -397,6 +375,6 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   return true;
 }
 
-bool PngToFramebufferConverter::supportsFormat(const std::string& extension) {
+bool PngToFramebufferConverter::supportsFormat(std::string_view extension) {
   return FsHelpers::hasPngExtension(extension);
 }

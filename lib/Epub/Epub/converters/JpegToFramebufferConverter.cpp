@@ -43,13 +43,12 @@ struct JpegContext {
 // File I/O callbacks use pFile->fHandle to access the FsFile*,
 // avoiding the need for global file state.
 void* jpegOpen(const char* filename, int32_t* size) {
-  FsFile* f = new FsFile();
+  auto f = std::make_unique<FsFile>();
   if (!Storage.openFileForRead("JPG", std::string(filename), *f)) {
-    delete f;
     return nullptr;
   }
   *size = f->size();
-  return f;
+  return f.release();
 }
 
 void jpegClose(void* handle) {
@@ -332,23 +331,18 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
 }  // namespace
 
-bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
+bool JpegToFramebufferConverter::getDimensionsStatic(std::string_view imagePath, ImageDimensions& out) {
   size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
     LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
     return false;
   }
 
-  JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
-  if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder for dimensions");
-    return false;
-  }
+  auto jpeg = std::make_unique<JPEGDEC>();
 
-  int rc = jpeg->open(imagePath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, nullptr);
+  int rc = jpeg->open(std::string(imagePath).c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, nullptr);
   if (rc != 1) {
-    LOG_ERR("JPG", "Failed to open JPEG for dimensions (err=%d): %s", jpeg->getLastError(), imagePath.c_str());
-    delete jpeg;
+    LOG_ERR("JPG", "Failed to open JPEG for dimensions (err=%d): %.*s", jpeg->getLastError(), static_cast<int>(imagePath.size()), imagePath.data());
     return false;
   }
 
@@ -357,13 +351,12 @@ bool JpegToFramebufferConverter::getDimensionsStatic(const std::string& imagePat
   LOG_DBG("JPG", "Image dimensions: %dx%d", out.width, out.height);
 
   jpeg->close();
-  delete jpeg;
   return true;
 }
 
-bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
+bool JpegToFramebufferConverter::decodeToFramebuffer(std::string_view imagePath, GfxRenderer& renderer,
                                                      const RenderConfig& config) {
-  LOG_DBG("JPG", "Decoding JPEG: %s", imagePath.c_str());
+  LOG_DBG("JPG", "Decoding JPEG: %.*s", static_cast<int>(imagePath.size()), imagePath.data());
 
   size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
@@ -371,11 +364,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     return false;
   }
 
-  JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
-  if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
-    return false;
-  }
+  auto jpeg = std::make_unique<JPEGDEC>();
 
   JpegContext ctx;
   ctx.renderer = &renderer;
@@ -383,10 +372,9 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   ctx.screenWidth = renderer.getScreenWidth();
   ctx.screenHeight = renderer.getScreenHeight();
 
-  int rc = jpeg->open(imagePath.c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, jpegDrawCallback);
+  int rc = jpeg->open(std::string(imagePath).c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, jpegDrawCallback);
   if (rc != 1) {
-    LOG_ERR("JPG", "Failed to open JPEG (err=%d): %s", jpeg->getLastError(), imagePath.c_str());
-    delete jpeg;
+    LOG_ERR("JPG", "Failed to open JPEG (err=%d): %.*s", jpeg->getLastError(), static_cast<int>(imagePath.size()), imagePath.data());
     return false;
   }
 
@@ -396,13 +384,11 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   if (srcWidth <= 0 || srcHeight <= 0) {
     LOG_ERR("JPG", "Invalid JPEG dimensions: %dx%d", srcWidth, srcHeight);
     jpeg->close();
-    delete jpeg;
     return false;
   }
 
   if (!validateImageDimensions(srcWidth, srcHeight, "JPEG")) {
     jpeg->close();
-    delete jpeg;
     return false;
   }
 
@@ -473,12 +459,10 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   if (rc != 1) {
     LOG_ERR("JPG", "Decode failed (rc=%d, lastError=%d)", rc, jpeg->getLastError());
     jpeg->close();
-    delete jpeg;
     return false;
   }
 
   jpeg->close();
-  delete jpeg;
   LOG_DBG("JPG", "JPEG decoding complete - render time: %lu ms", decodeTime);
 
   // Write cache file if caching was enabled
@@ -489,6 +473,6 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   return true;
 }
 
-bool JpegToFramebufferConverter::supportsFormat(const std::string& extension) {
+bool JpegToFramebufferConverter::supportsFormat(std::string_view extension) {
   return FsHelpers::hasJpgExtension(extension);
 }

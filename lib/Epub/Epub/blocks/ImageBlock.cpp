@@ -57,19 +57,14 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
 
   // Read and render row by row to minimize memory usage
   const int bytesPerRow = (cachedWidth + 3) / 4;  // 2 bits per pixel, 4 pixels per byte
-  uint8_t* rowBuffer = (uint8_t*)malloc(bytesPerRow);
-  if (!rowBuffer) {
-    LOG_ERR("IMG", "Failed to allocate row buffer");
-    return false;
-  }
+  std::vector<uint8_t> rowBuffer(bytesPerRow);
 
   DirectPixelWriter pw;
   pw.init(renderer);
 
   for (int row = 0; row < cachedHeight; row++) {
-    if (cacheFile.read(rowBuffer, bytesPerRow) != bytesPerRow) {
+    if (cacheFile.read(rowBuffer.data(), bytesPerRow) != bytesPerRow) {
       LOG_ERR("IMG", "Cache read error at row %d", row);
-      free(rowBuffer);
       return false;
     }
 
@@ -84,7 +79,6 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
     }
   }
 
-  free(rowBuffer);
   LOG_DBG("IMG", "Cache render complete");
   return true;
 }
@@ -168,5 +162,5 @@ std::unique_ptr<ImageBlock> ImageBlock::deserialize(FsFile& file) {
   int16_t w, h;
   serialization::readPod(file, w);
   serialization::readPod(file, h);
-  return std::unique_ptr<ImageBlock>(new ImageBlock(path, w, h));
+  return std::make_unique<ImageBlock>(path, w, h);
 }
