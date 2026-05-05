@@ -107,6 +107,7 @@ void EpubReaderActivity::onExit() {
 
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
+  chapterSkipConsumedForHold = false;
   section.reset();
   epub.reset();
 }
@@ -144,6 +145,17 @@ void EpubReaderActivity::loop() {
     }
   }
 
+  if (skipNextButtonCheck) {
+    const bool confirmCleared = !mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+                                !mappedInput.wasReleased(MappedInputManager::Button::Confirm);
+    const bool backCleared = !mappedInput.isPressed(MappedInputManager::Button::Back) &&
+                             !mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (confirmCleared && backCleared) {
+      skipNextButtonCheck = false;
+    }
+    return;
+  }
+
   // Enter reader menu activity.
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     const int currentPage = section ? section->currentPage + 1 : 0;
@@ -158,6 +170,12 @@ void EpubReaderActivity::loop() {
                                renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
                                SETTINGS.orientation, !currentPageFootnotes.empty()),
                            [this](const ActivityResult& result) {
+                             skipNextButtonCheck = true;
+                             // The display currently contains the reader menu (or Bluetooth screen),
+                             // not the book page. Force one stronger refresh when returning so the
+                             // next book render re-establishes a clean differential baseline.
+                             pagesUntilFullRefresh = 1;
+
                              // Always apply orientation change even if the menu was cancelled
                              const auto& menu = std::get<MenuResult>(result.data);
                              applyOrientation(menu.orientation);
@@ -382,6 +400,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     case EpubReaderMenuActivity::MenuAction::GO_HOME: {
       onGoHome();
       return;
+    }
+    case EpubReaderMenuActivity::MenuAction::BLUETOOTH: {
+      activityManager.goToBluetoothSettings(true);
+      break;
     }
     case EpubReaderMenuActivity::MenuAction::DELETE_CACHE: {
       {
@@ -721,7 +743,7 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
   if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                     SETTINGS.imageRendering)) {
+                                     SETTINGS.imageRendering, nullptr, true)) {
     LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
   }
 }
@@ -730,8 +752,8 @@ void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
   FsFile f;
   if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/progress.bin", f)) {
     uint8_t data[6];
-    data[0] = currentSpineIndex & 0xFF;
-    data[1] = (currentSpineIndex >> 8) & 0xFF;
+    data[0] = spineIndex & 0xFF;
+    data[1] = (spineIndex >> 8) & 0xFF;
     data[2] = currentPage & 0xFF;
     data[3] = (currentPage >> 8) & 0xFF;
     data[4] = pageCount & 0xFF;
@@ -763,6 +785,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   // Force special handling for pages with images when anti-aliasing is on
   bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
+  const int currentPageForStatus = section ? section->currentPage + 1 : 0;
+  const int pageCountForStatus = section ? section->pageCount : 0;
+  const float chapterProgressForStatus =
+      (pageCountForStatus > 0) ? (static_cast<float>(currentPageForStatus) / pageCountForStatus) : 0.0f;
+  const float bookProgressForStatus =
+      (epub && pageCountForStatus > 0) ? epub->calculateProgress(currentSpineIndex, chapterProgressForStatus) * 100.0f
+                                       : 0.0f;
+  const bool bleCounterRefresh = ReaderUtils::shouldStrengthenBleStatusCounterRefresh(pagesUntilFullRefresh);
 
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
@@ -780,9 +810,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
-      // Re-render page content to restore images into the blanked area
-      // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
+      // Re-render page content to restore images into the blanked area.
+      // Re-draw the status bar so the final BW frame stays fully in sync.
       page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      renderStatusBar();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
@@ -791,10 +822,24 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   } else {
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
+
+  if (bleCounterRefresh) {
+    ReaderUtils::refreshStatusBarCounterWindow(renderer, bookProgressForStatus, currentPageForStatus,
+                                               pageCountForStatus);
+  }
   const auto tDisplay = millis();
 
-  // Save bw buffer to reset buffer state after grayscale data sync
-  renderer.storeBwBuffer();
+  // Save BW buffer only when the grayscale AA pass needs it. When BLE is connected,
+  // the extra scratch copy can fail under runtime memory pressure; if that happens
+  // we fall back to re-rendering the BW frame after the grayscale overlay so the
+  // next FAST_REFRESH still compares against the correct previous page.
+  bool bwBufferStored = false;
+  if (SETTINGS.textAntiAliasing) {
+    bwBufferStored = renderer.storeBwBuffer();
+    if (!bwBufferStored) {
+      LOG_ERR("ERS", "AA fallback: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
+    }
+  }
   const auto tBwStore = millis();
 
   // grayscale rendering
@@ -819,8 +864,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.setRenderMode(GfxRenderer::BW);
     fcm->logStats("gray");
 
-    // restore the bw data
-    renderer.restoreBwBuffer();
+    // Restore the BW frame for the next differential refresh. If the temporary
+    // copy failed (e.g. BLE reduced available heap), rebuild the page into the
+    // framebuffer and sync RED RAM from that instead of leaving grayscale data
+    // behind for the next FAST_REFRESH.
+    if (bwBufferStored) {
+      renderer.restoreBwBuffer();
+    } else {
+      renderer.clearScreen();
+      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      renderStatusBar();
+      renderer.cleanupGrayscaleWithFrameBuffer();
+    }
     const auto tBwRestore = millis();
 
     const auto tEnd = millis();
@@ -830,15 +885,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
             tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
             tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
   } else {
-    // restore the bw data
-    renderer.restoreBwBuffer();
-    const auto tBwRestore = millis();
-
     const auto tEnd = millis();
-    LOG_DBG("ERS",
-            "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store=%lums bw_restore=%lums total=%lums",
-            tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tBwRestore - tBwStore,
-            tEnd - t0);
+    LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums",
+            tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
   }
 }
 

@@ -12,6 +12,7 @@
 #include "home/RecentBooksActivity.h"
 #include "network/CrossPointWebServerActivity.h"
 #include "reader/ReaderActivity.h"
+#include "settings/BluetoothSettingsActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/FullScreenMessageActivity.h"
@@ -171,6 +172,12 @@ void ActivityManager::goToFileTransfer() {
 }
 
 void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
+
+void ActivityManager::goToBluetoothSettings(bool exitOnSuccessfulConnect) {
+  pushActivity(std::make_unique<BluetoothSettingsActivity>(renderer, mappedInput,
+                                                           [] { activityManager.popActivity(); },
+                                                           exitOnSuccessfulConnect));
+}
 
 void ActivityManager::goToFileBrowser(std::string path) {
   replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));

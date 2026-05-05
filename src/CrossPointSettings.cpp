@@ -240,6 +240,24 @@ bool CrossPointSettings::loadFromBinaryFile() {
     if (++settingsRead >= fileSettingsCount) break;
     serialization::readPod(inputFile, embeddedStyle);
     if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, bluetoothEnabled);
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string addrStr;
+      serialization::readString(inputFile, addrStr);
+      strncpy(bleBondedDeviceAddr, addrStr.c_str(), sizeof(bleBondedDeviceAddr) - 1);
+      bleBondedDeviceAddr[sizeof(bleBondedDeviceAddr) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string nameStr;
+      serialization::readString(inputFile, nameStr);
+      strncpy(bleBondedDeviceName, nameStr.c_str(), sizeof(bleBondedDeviceName) - 1);
+      bleBondedDeviceName[sizeof(bleBondedDeviceName) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, bleBondedDeviceAddrType);
+    if (++settingsRead >= fileSettingsCount) break;
   } while (false);
 
   if (frontButtonMappingRead) {

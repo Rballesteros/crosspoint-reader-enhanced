@@ -145,6 +145,12 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (s.language < getLanguageCount()) ? LANGUAGE_CODES[s.language] : "EN";
 
+  // Bluetooth bonded remote metadata is not represented in SettingsList, but it
+  // must survive reboot so the firmware can reconnect to the remembered device.
+  doc["bleBondedDeviceAddr"] = s.bleBondedDeviceAddr;
+  doc["bleBondedDeviceName"] = s.bleBondedDeviceName;
+  doc["bleBondedDeviceAddrType"] = s.bleBondedDeviceAddrType;
+
   String json;
   serializeJson(doc, json);
   return Storage.writeFile(path, json);
@@ -228,6 +234,16 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
   if (doc["language"].is<const char*>()) {
     s.language = static_cast<uint8_t>(I18n::languageFromCode(doc["language"].as<const char*>()));
   }
+
+  const std::string bondedAddr = doc["bleBondedDeviceAddr"] | std::string(s.bleBondedDeviceAddr);
+  strncpy(s.bleBondedDeviceAddr, bondedAddr.c_str(), sizeof(s.bleBondedDeviceAddr) - 1);
+  s.bleBondedDeviceAddr[sizeof(s.bleBondedDeviceAddr) - 1] = '\0';
+
+  const std::string bondedName = doc["bleBondedDeviceName"] | std::string(s.bleBondedDeviceName);
+  strncpy(s.bleBondedDeviceName, bondedName.c_str(), sizeof(s.bleBondedDeviceName) - 1);
+  s.bleBondedDeviceName[sizeof(s.bleBondedDeviceName) - 1] = '\0';
+
+  s.bleBondedDeviceAddrType = doc["bleBondedDeviceAddrType"] | s.bleBondedDeviceAddrType;
 
   LOG_DBG("CPS", "Settings loaded from file");
 

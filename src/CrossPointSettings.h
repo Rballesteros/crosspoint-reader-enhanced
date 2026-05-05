@@ -207,6 +207,12 @@ class CrossPointSettings {
   uint8_t embeddedStyle = 1;
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
   uint8_t showHiddenFiles = 0;
+  // Bluetooth enabled state (persistent)
+  uint8_t bluetoothEnabled = 0;
+  // BLE bonded remote settings
+  char bleBondedDeviceAddr[18] = "";
+  char bleBondedDeviceName[32] = "";
+  uint8_t bleBondedDeviceAddrType = 0;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
