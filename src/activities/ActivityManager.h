@@ -7,6 +7,7 @@
 #include <cassert>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "GfxRenderer.h"
@@ -81,13 +82,13 @@ class ActivityManager {
   void goToFileTransfer();
   void goToSettings();
   void goToBluetoothSettings(bool exitOnSuccessfulConnect = false);
-  void goToFileBrowser(std::string path = {});
+  void goToFileBrowser(std::string_view path = {});
   void goToRecentBooks();
   void goToBrowser();
-  void goToReader(std::string path);
+  void goToReader(std::string_view path);
   void goToSleep();
   void goToBoot();
-  void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
+  void goToFullScreenMessage(std::string_view message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
   void goToCrashReport();
   void goHome();
 

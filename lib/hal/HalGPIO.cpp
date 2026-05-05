@@ -353,29 +353,43 @@ void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
     // Fast path - no duration check needed
     return;
   }
-  // TODO: Intermittent edge case remains: a single tap followed by another single tap
-  // can still power on the device. Tighten wake debounce/state handling here.
+  // To prevent an edge case where a single tap followed by another single tap
+  // triggers a power-on (due to `millis() - start < 1000` waiting logic), we
+  // ensure the button is continuously held, bailing out if it is ever released
+  // during the required hold window.
 
   // Calibrate: subtract boot time already elapsed, assuming button held since boot
-  const uint16_t calibration = millis();
-  const uint16_t calibratedDuration = (calibration < requiredDurationMs) ? (requiredDurationMs - calibration) : 1;
+  const unsigned long calibration = millis();
+  const unsigned long calibratedDuration = (calibration < requiredDurationMs) ? (requiredDurationMs - calibration) : 1;
 
   const auto start = millis();
   inputMgr.update();
-  // inputMgr.isPressed() may take up to ~500ms to return correct state
+  
+  // Wait up to 1000ms for the input manager to register the press (it can take time to init)
+  // If the button is released during this time (or wasn't pressed), startDeepSleep will be called.
   while (!inputMgr.isPressed(BTN_POWER) && millis() - start < 1000) {
     delay(10);
     inputMgr.update();
   }
+
   if (inputMgr.isPressed(BTN_POWER)) {
     do {
       delay(10);
       inputMgr.update();
-    } while (inputMgr.isPressed(BTN_POWER) && inputMgr.getHeldTime() < calibratedDuration);
+      
+      // Early bail-out: if the button is released before the duration is met, sleep immediately
+      if (!inputMgr.isPressed(BTN_POWER)) {
+        startDeepSleep();
+        return;
+      }
+    } while (inputMgr.getHeldTime() < calibratedDuration && millis() - start < 2000);
+    
+    // Check one final time in case the loop timed out
     if (inputMgr.getHeldTime() < calibratedDuration) {
       startDeepSleep();
     }
   } else {
+    // Button not pressed at all during initial window
     startDeepSleep();
   }
 }

@@ -21,7 +21,7 @@ void ActivityManager::begin() {
   xTaskCreate(&renderTaskTrampoline, "ActivityManagerRender",
               8192,              // Stack size
               this,              // Parameters
-              1,                 // Priority
+              3,                 // Priority: Higher priority than the default loop to ensure responsive rendering
               &renderTaskHandle  // Task handle
   );
   assert(renderTaskHandle != nullptr && "Failed to create render task");
@@ -179,8 +179,8 @@ void ActivityManager::goToBluetoothSettings(bool exitOnSuccessfulConnect) {
                                                            exitOnSuccessfulConnect));
 }
 
-void ActivityManager::goToFileBrowser(std::string path) {
-  replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
+void ActivityManager::goToFileBrowser(std::string_view path) {
+  replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::string(path)));
 }
 
 void ActivityManager::goToRecentBooks() {
@@ -197,8 +197,8 @@ void ActivityManager::goToBrowser() {
   }
 }
 
-void ActivityManager::goToReader(std::string path) {
-  replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path)));
+void ActivityManager::goToReader(std::string_view path) {
+  replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::string(path)));
 }
 
 void ActivityManager::goToSleep() {
@@ -208,8 +208,8 @@ void ActivityManager::goToSleep() {
 
 void ActivityManager::goToBoot() { replaceActivity(std::make_unique<BootActivity>(renderer, mappedInput)); }
 
-void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::Style style) {
-  replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::move(message), style));
+void ActivityManager::goToFullScreenMessage(std::string_view message, EpdFontFamily::Style style) {
+  replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::string(message), style));
 }
 
 void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
