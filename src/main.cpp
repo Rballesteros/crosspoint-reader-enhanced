@@ -226,9 +226,11 @@ void setup() {
   ButtonNavigator::setMappedInputManager(mappedInputManager);
 
   auto& btMgr = BluetoothHIDManager::getInstance();
-  btMgr.setButtonInjector([](uint8_t buttonIndex, bool pressed) { gpio.setVirtualButtonState(buttonIndex, pressed); });
-  btMgr.setButtonActivityNotifier([](uint8_t buttonIndex) { gpio.updateVirtualButtonActivity(buttonIndex); });
-  btMgr.setReaderContextCallback([]() { return gBluetoothReaderContext; });
+  btMgr.setButtonInjector(
+      [](void*, uint8_t buttonIndex, bool pressed) { gpio.setVirtualButtonState(buttonIndex, pressed); }, nullptr);
+  btMgr.setButtonActivityNotifier(
+      [](void*, uint8_t buttonIndex) { gpio.updateVirtualButtonActivity(buttonIndex); }, nullptr);
+  btMgr.setReaderContextCallback([](void*) { return gBluetoothReaderContext; }, nullptr);
   btMgr.setBondedDevice(SETTINGS.bleBondedDeviceAddr, SETTINGS.bleBondedDeviceName,
                         SETTINGS.bleBondedDeviceAddrType);
   LOG_INF("MAIN", "Bluetooth HID initialized with button injection");
@@ -310,6 +312,8 @@ void loop() {
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+  static bool lastBluetoothStatusVisible = BaseTheme::showBluetoothStatusIndicator();
+  static bool lastBluetoothStatusConnected = BaseTheme::isBluetoothStatusConnected();
 
   gpio.update();
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
@@ -319,9 +323,44 @@ void loop() {
 
   gBluetoothReaderContext = activityManager.isReaderActivity();
   auto& btMgr = BluetoothHIDManager::getInstance();
-  btMgr.updateActivity();
-  btMgr.checkAutoReconnect(userInputDetected);
-  bleRecentActivity = btMgr.hasRecentActivity();
+  // Reader-only: if BT has been disconnected for several seconds in reader, release the
+  // radio to free NimBLE's ~50-80KB so EPUB rendering doesn't OOM. The wake-on-input
+  // path below will bring it back. Avoids the original 60s idle window that let the
+  // heap stay pinned long enough to crash mid-chapter.
+  static unsigned long btDisconnectedSinceMs = 0;
+  if (btMgr.isEnabled() && gBluetoothReaderContext && !btMgr.hasConnectedDevice()) {
+    const unsigned long now = millis();
+    if (btDisconnectedSinceMs == 0) {
+      btDisconnectedSinceMs = now;
+    } else if (now - btDisconnectedSinceMs > 8000) {
+      LOG_INF("BT", "BT disconnected >8s in reader; releasing radio to free heap");
+      btMgr.disable();
+      btDisconnectedSinceMs = 0;
+    }
+  } else {
+    btDisconnectedSinceMs = 0;
+  }
+  // Skip auto-wake/reconnect polling when neither settings nor the runtime stack are active.
+  // We never auto-disable here — other paths (settings activity, debug serial commands,
+  // wizards) may enable BT without flipping SETTINGS, and tearing them down would break them.
+  if (SETTINGS.bluetoothEnabled || btMgr.isEnabled()) {
+    if (SETTINGS.bluetoothEnabled && gBluetoothReaderContext && userInputDetected && !btMgr.isEnabled() &&
+        SETTINGS.bleBondedDeviceAddr[0] != '\0') {
+      LOG_INF("BT", "Local input detected; waking Bluetooth for bonded-device reconnect");
+      btMgr.enable();
+    }
+    btMgr.updateActivity();
+    btMgr.checkAutoReconnect(userInputDetected);
+    bleRecentActivity = btMgr.hasRecentActivity();
+  }
+  const bool bluetoothStatusVisible = BaseTheme::showBluetoothStatusIndicator();
+  const bool bluetoothStatusConnected = BaseTheme::isBluetoothStatusConnected();
+  if (bluetoothStatusVisible != lastBluetoothStatusVisible ||
+      bluetoothStatusConnected != lastBluetoothStatusConnected) {
+    activityManager.requestUpdate();
+    lastBluetoothStatusVisible = bluetoothStatusVisible;
+    lastBluetoothStatusConnected = bluetoothStatusConnected;
+  }
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 

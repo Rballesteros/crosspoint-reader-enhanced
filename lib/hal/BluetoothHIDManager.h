@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <string>
 #include <vector>
-#include <functional>
 #include <map>
 #include "DeviceProfiles.h"
 
@@ -76,7 +75,7 @@ public:
   bool isEnabled() const;
 
   // Scanning
-  void startScan(uint32_t durationMs = 10000);
+  void startScan(uint32_t durationMs = 10000, bool bondedOnly = false);
   void stopScan();
   bool isScanning() const;
 
@@ -87,20 +86,33 @@ public:
   bool connectToDevice(const std::string& address, uint8_t addrTypeOverride = 0, bool useAddrTypeOverride = false);
   bool disconnectFromDevice(const std::string& address);
   bool isConnected(const std::string& address) const;
+  bool hasConnectedDevice() const;
   std::vector<ConnectedDevice> getConnectedDevicesCopy() const;
+  void refreshLearnedActionOverrides();
 
   // Probe an advertised device to read its GATT Device Name (0x2A00) without
   // committing to a full HID connection. Updates the matching entry in
   // _discoveredDevices on success. Returns true if a non-empty name was read.
   bool identifyDevice(const std::string& address);
 
-  // Input handling
+  // Input handling. Callbacks are raw fn-ptr + ctx pairs (instead of
+  // std::function) to avoid the ~2-4 KB heap/binary cost per closure on the
+  // memory-constrained ESP32-C3.
+  using InputCb = void (*)(void* ctx, uint16_t keycode);
+  using LearnInputCb = void (*)(void* ctx, uint8_t keycode, uint8_t reportIndex);
+  using DebugInputCb = void (*)(void* ctx, uint8_t keycode, uint8_t reportIndex, uint8_t mappedButton, bool pressed,
+                                const uint8_t* raw, uint8_t rawLength);
+  using ButtonInjectorCb = void (*)(void* ctx, uint8_t buttonIndex, bool pressed);
+  using ReaderContextCb = bool (*)(void* ctx);
+  using ButtonActivityCb = void (*)(void* ctx, uint8_t buttonIndex);
+
   void processInputEvents();
-  void setInputCallback(std::function<void(uint16_t keycode)> callback);
-  void setLearnInputCallback(std::function<void(uint8_t keycode, uint8_t reportIndex)> callback);
-  void setButtonInjector(std::function<void(uint8_t buttonIndex, bool pressed)> injector);
-  void setReaderContextCallback(std::function<bool()> callback);
-  void setButtonActivityNotifier(std::function<void(uint8_t buttonIndex)> notifier);
+  void setInputCallback(InputCb callback, void* ctx);
+  void setLearnInputCallback(LearnInputCb callback, void* ctx);
+  void setDebugInputCallback(DebugInputCb callback, void* ctx);
+  void setButtonInjector(ButtonInjectorCb injector, void* ctx);
+  void setReaderContextCallback(ReaderContextCb callback, void* ctx);
+  void setButtonActivityNotifier(ButtonActivityCb notifier, void* ctx);
   void setDebugCaptureEnabled(bool enabled) { _debugCaptureEnabled = enabled; }
   bool isDebugCaptureEnabled() const { return _debugCaptureEnabled; }
   void setBondedDevice(const std::string& address, const std::string& name = "", uint8_t addrType = 0);
@@ -112,9 +124,9 @@ public:
   bool hasRecentActivity() const;
   bool hadRecentFree2Input(unsigned long windowMs = 1500) const;
 
-  // State persistence
-  void saveState();
-  void loadState();
+  // Note: bonded-device persistence lives at the SETTINGS layer
+  // (CrossPointSettings::bleBondedDevice*); this manager holds only the
+  // in-memory snapshot pushed in via setBondedDevice().
 
   std::string lastError;
 
@@ -134,18 +146,28 @@ private:
   uint16_t parseHIDReport(uint8_t* data, size_t length);
   // Caller must hold _stateMutex while using the returned pointer.
   ConnectedDevice* findConnectedDevice(const std::string& address);
+  void applyLearnedActionOverrides(ConnectedDevice& device) const;
   uint8_t mapKeycodeToButton(uint8_t keycode, ConnectedDevice* device);
 
   bool _enabled = false;
   bool _scanning = false;
+  unsigned long _lastScanEndTime = 0;
   std::vector<BluetoothDevice> _discoveredDevices;
+  bool _bondedOnlyScan = false;
   mutable SemaphoreHandle_t _stateMutex = nullptr;
   std::vector<ConnectedDevice> _connectedDevices;
-  std::function<void(uint16_t)> _inputCallback;
-  std::function<void(uint8_t, uint8_t)> _learnInputCallback;
-  std::function<void(uint8_t, bool)> _buttonInjector;
-  std::function<bool()> _readerContextCallback;
-  std::function<void(uint8_t)> _buttonActivityNotifier;
+  InputCb _inputCallback = nullptr;
+  void* _inputCallbackCtx = nullptr;
+  LearnInputCb _learnInputCallback = nullptr;
+  void* _learnInputCallbackCtx = nullptr;
+  DebugInputCb _debugInputCallback = nullptr;
+  void* _debugInputCallbackCtx = nullptr;
+  ButtonInjectorCb _buttonInjector = nullptr;
+  void* _buttonInjectorCtx = nullptr;
+  ReaderContextCb _readerContextCallback = nullptr;
+  void* _readerContextCallbackCtx = nullptr;
+  ButtonActivityCb _buttonActivityNotifier = nullptr;
+  void* _buttonActivityNotifierCtx = nullptr;
   bool _debugCaptureEnabled = false;
   std::string _bondedDeviceAddress;
   std::string _bondedDeviceName;
@@ -156,5 +178,7 @@ private:
 
   // Inactivity timeout (milliseconds)
   static constexpr unsigned long INACTIVITY_TIMEOUT_MS = 300000;  // 5 minutes
+  static constexpr unsigned long DISCONNECTED_IDLE_DISABLE_MS = 60000;  // 1 minute
   unsigned long lastMaintenanceCheck = 0;
+  unsigned long disconnectedIdleSince = 0;
 };
