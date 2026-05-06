@@ -174,10 +174,12 @@ bool RecentBooksStore::loadFromBinaryFile() {
     if (omitted > 0) {
       // Explicitly close() file before saveToFile() rewrites the same file
       inputFile.close();
+      recentBooks.shrink_to_fit();
       saveToFile();
       LOG_DBG("RBS", "Omitted %u recent book(s) with missing title", omitted);
       return true;
     }
+    recentBooks.shrink_to_fit();
   } else {
     LOG_ERR("RBS", "Deserialization failed: Unknown version %u", version);
     return false;
