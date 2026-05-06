@@ -31,6 +31,8 @@ class Activity {
   virtual ~Activity() = default;
   virtual void onEnter();
   virtual void onExit();
+  virtual void onPause() {}
+  virtual void onResume() { requestUpdate(); }
   virtual void loop() {}
 
   virtual void render(RenderLock&&) {}

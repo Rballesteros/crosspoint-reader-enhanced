@@ -63,6 +63,7 @@ class EpubReaderActivity final : public Activity {
       : Activity("EpubReader", renderer, mappedInput), epub(std::move(epub)) {}
   void onEnter() override;
   void onExit() override;
+  void onPause() override;
   void loop() override;
   void render(RenderLock&& lock) override;
   bool isReaderActivity() const override { return true; }

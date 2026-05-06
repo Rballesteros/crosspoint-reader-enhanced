@@ -102,6 +102,17 @@ void EpubReaderActivity::onExit() {
   epub.reset();
 }
 
+void EpubReaderActivity::onPause() {
+  Activity::onPause();
+
+  // Clear font cache when backgrounded to release heap for other activities.
+  // Reader is very heap-intensive; freeing ~30KB+ of font bitmaps here
+  // helps prevent OOM during chapter selection or wifi browsing.
+  if (renderer.getFontCacheManager()) {
+    renderer.getFontCacheManager()->clearCache();
+  }
+}
+
 void EpubReaderActivity::loop() {
   if (!epub) {
     // Should never happen
@@ -110,8 +121,8 @@ void EpubReaderActivity::loop() {
   }
 
   if (automaticPageTurnActive) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
-        mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm) ||
+        ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
       automaticPageTurnActive = false;
       // updates chapter title space to indicate page turn disabled
       requestUpdate();
@@ -147,7 +158,7 @@ void EpubReaderActivity::loop() {
   }
 
   // Enter reader menu activity.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
     const int currentPage = section ? section->currentPage + 1 : 0;
     const int totalPages = section ? section->pageCount : 0;
     float bookProgress = 0.0f;
@@ -156,9 +167,24 @@ void EpubReaderActivity::loop() {
       bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
     }
     const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+    std::string chapterTitle;
+    int chapterNumber = 0;
+    int chapterCount = 0;
+    const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+    if (tocIndex >= 0) {
+      const auto tocItem = epub->getTocItem(tocIndex);
+      chapterTitle = tocItem.title.empty() ? tr(STR_UNNAMED) : tocItem.title;
+      chapterNumber = tocIndex + 1;
+      chapterCount = epub->getTocItemsCount();
+    } else {
+      chapterTitle = std::string(tr(STR_SECTION_PREFIX)) + std::to_string(currentSpineIndex + 1);
+      chapterNumber = currentSpineIndex + 1;
+      chapterCount = epub->getSpineItemsCount();
+    }
     startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
-                               renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                               SETTINGS.orientation, !currentPageFootnotes.empty()),
+                               renderer, mappedInput, epub->getTitle(), chapterTitle, chapterNumber, chapterCount,
+                               currentPage, totalPages, bookProgressPercent, SETTINGS.orientation,
+                               !currentPageFootnotes.empty()),
                            [this](const ActivityResult& result) {
                              skipNextButtonCheck = true;
                              // The display currently contains the reader menu (or Bluetooth screen),
@@ -176,6 +202,15 @@ void EpubReaderActivity::loop() {
                            });
   }
 
+  if (ReaderUtils::preferPressForBleInput() && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    if (footnoteDepth > 0) {
+      restoreSavedPosition();
+      return;
+    }
+    activityManager.goHome();
+    return;
+  }
+
   // Long press BACK (1s+) goes to file selection
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(epub ? epub->getPath() : "");
@@ -183,7 +218,8 @@ void EpubReaderActivity::loop() {
   }
 
   // Short press BACK goes directly to home (or restores position if viewing footnote)
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+  if (!ReaderUtils::preferPressForBleInput() &&
+      mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
@@ -845,7 +881,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     bwBufferStored = renderer.storeBwBuffer();
     if (!bwBufferStored) {
       const auto tEnd = millis();
-      LOG_ERR("ERS", "Skipping AA: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
+      LOG_DBG("ERS", "Skipping AA: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
       LOG_DBG("ERS",
               "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store_fail=%lums total=%lums",
               tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - tDisplay, tEnd - t0);

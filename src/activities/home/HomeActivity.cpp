@@ -8,6 +8,7 @@
 #include <I18n.h>
 #include <Utf8.h>
 #include <Xtc.h>
+#include <esp_heap_caps.h>
 
 #include <cstring>
 #include <vector>
@@ -19,6 +20,10 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+namespace {
+constexpr uint8_t HOME_CLEAN_REFRESH_INTERVAL = 8;
+}
 
 int HomeActivity::getMenuItemCount() const {
   int count = 4;  // File Browser, Recents, File transfer, Settings
@@ -114,6 +119,8 @@ void HomeActivity::onEnter() {
   hasOpdsServers = OPDS_STORE.hasServers();
 
   selectorIndex = 0;
+  firstRenderDone = false;
+  fastRefreshesSinceClean = HOME_CLEAN_REFRESH_INTERVAL;
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   loadRecentBooks(metrics.homeRecentBooksCount);
@@ -129,6 +136,15 @@ void HomeActivity::onExit() {
   freeCoverBuffer();
 }
 
+void HomeActivity::onPause() {
+  Activity::onPause();
+
+  // Free the stored cover buffer when pushed to stack to save heap for
+  // the activity on top (e.g. Reader or Settings). It will be re-rendered
+  // and re-stored if needed when we return.
+  freeCoverBuffer();
+}
+
 bool HomeActivity::storeCoverBuffer() {
   uint8_t* frameBuffer = renderer.getFrameBuffer();
   if (!frameBuffer) {
@@ -139,12 +155,38 @@ bool HomeActivity::storeCoverBuffer() {
   freeCoverBuffer();
 
   const size_t bufferSize = renderer.getBufferSize();
-  coverBuffer.assign(frameBuffer, frameBuffer + bufferSize);
+  // Safety margin tuned so the cache engages when BT is loaded (NimBLE consumes ~50KB heap,
+  // leaving ~65KB free). Without the cache, all covers get re-decoded/scaled on every redraw,
+  // adding ~250ms per render. The cover decode has already happened by the time we get here,
+  // so the remaining heap pressure is just the next frame's incremental work.
+  constexpr size_t COVER_BUFFER_HEAP_SAFETY_MARGIN = 8 * 1024;
+  const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const size_t requiredFree = bufferSize + COVER_BUFFER_HEAP_SAFETY_MARGIN;
+  if (freeBefore < requiredFree || largestBefore < bufferSize) {
+    LOG_DBG("HOME", "Skipping cover buffer store: free=%u maxAlloc=%u needFree=%u needChunk=%u",
+            static_cast<unsigned>(freeBefore), static_cast<unsigned>(largestBefore), static_cast<unsigned>(requiredFree),
+            static_cast<unsigned>(bufferSize));
+    return false;
+  }
+
+  coverBuffer = static_cast<uint8_t*>(heap_caps_malloc(bufferSize, MALLOC_CAP_8BIT));
+  if (!coverBuffer) {
+    LOG_DBG("HOME", "Cover buffer allocation failed: free=%u maxAlloc=%u need=%u",
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(bufferSize));
+    return false;
+  }
+
+  memcpy(coverBuffer, frameBuffer, bufferSize);
+  coverBufferSize = bufferSize;
+  coverBufferStored = true;
   return true;
 }
 
 bool HomeActivity::restoreCoverBuffer() {
-  if (coverBuffer.empty()) {
+  if (!coverBuffer || coverBufferSize == 0 || coverBufferSize != renderer.getBufferSize()) {
     return false;
   }
 
@@ -153,25 +195,28 @@ bool HomeActivity::restoreCoverBuffer() {
     return false;
   }
 
-  memcpy(frameBuffer, coverBuffer.data(), coverBuffer.size());
+  memcpy(frameBuffer, coverBuffer, coverBufferSize);
   return true;
 }
 
 void HomeActivity::freeCoverBuffer() {
-  coverBuffer.clear();
-  coverBuffer.shrink_to_fit();
+  if (coverBuffer) {
+    heap_caps_free(coverBuffer);
+    coverBuffer = nullptr;
+  }
+  coverBufferSize = 0;
   coverBufferStored = false;
 }
 
 void HomeActivity::loop() {
   const int menuCount = getMenuItemCount();
 
-  buttonNavigator.onNext([this, menuCount] {
+  buttonNavigator.onNextPress([this, menuCount] {
     selectorIndex = ButtonNavigator::nextIndex(selectorIndex, menuCount);
     requestUpdate();
   });
 
-  buttonNavigator.onPrevious([this, menuCount] {
+  buttonNavigator.onPreviousPress([this, menuCount] {
     selectorIndex = ButtonNavigator::previousIndex(selectorIndex, menuCount);
     requestUpdate();
   });
@@ -246,7 +291,9 @@ void HomeActivity::render(RenderLock&&) {
   const auto labels = mappedInput.mapLabels("", tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  renderer.displayBuffer();
+  const bool useCleanRefresh = !firstRenderDone || fastRefreshesSinceClean >= HOME_CLEAN_REFRESH_INTERVAL;
+  renderer.displayBuffer(useCleanRefresh ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+  fastRefreshesSinceClean = useCleanRefresh ? 0 : fastRefreshesSinceClean + 1;
 
   if (!firstRenderDone) {
     firstRenderDone = true;

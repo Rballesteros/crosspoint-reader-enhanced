@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -18,7 +20,9 @@ class HomeActivity final : public Activity {
   bool hasOpdsServers = false;
   bool coverRendered = false;      // Track if cover has been rendered once
   bool coverBufferStored = false;  // Track if cover buffer is stored
-  std::vector<uint8_t> coverBuffer;  // HomeActivity's own buffer for cover image
+  uint8_t* coverBuffer = nullptr;  // Optional framebuffer cache for cover image
+  size_t coverBufferSize = 0;
+  uint8_t fastRefreshesSinceClean = 0;
   std::vector<RecentBook> recentBooks;
   void onFileBrowserOpen();
   void onRecentsOpen();
@@ -36,8 +40,10 @@ class HomeActivity final : public Activity {
  public:
   explicit HomeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity("Home", renderer, mappedInput) {}
+  ~HomeActivity() override { freeCoverBuffer(); }
   void onEnter() override;
   void onExit() override;
+  void onPause() override;
   void loop() override;
   void render(RenderLock&&) override;
 };

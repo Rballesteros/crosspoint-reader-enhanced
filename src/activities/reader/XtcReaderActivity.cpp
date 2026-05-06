@@ -7,6 +7,7 @@
 
 #include "XtcReaderActivity.h"
 
+#include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -55,9 +56,18 @@ void XtcReaderActivity::onExit() {
   xtc.reset();
 }
 
+void XtcReaderActivity::onPause() {
+  Activity::onPause();
+
+  // Clear font cache when backgrounded to release heap for other activities.
+  if (renderer.getFontCacheManager()) {
+    renderer.getFontCacheManager()->clearCache();
+  }
+}
+
 void XtcReaderActivity::loop() {
   // Enter chapter selection activity
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
     if (xtc && xtc->hasChapters() && !xtc->getChapters().empty()) {
       startActivityForResult(std::make_unique<XtcReaderChapterSelectionActivity>(this->renderer, this->mappedInput,
                                                                                  xtc, currentPage),
@@ -70,6 +80,11 @@ void XtcReaderActivity::loop() {
     }
   }
 
+  if (ReaderUtils::preferPressForBleInput() && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    activityManager.goHome();
+    return;
+  }
+
   // Long press BACK (1s+) goes to file selection
   const unsigned long backHeldMs = mappedInput.getHeldTime(MappedInputManager::Button::Back);
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && backHeldMs >= goHomeMs) {
@@ -78,7 +93,8 @@ void XtcReaderActivity::loop() {
   }
 
   // Short press BACK goes directly to home
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) && backHeldMs < goHomeMs) {
+  if (!ReaderUtils::preferPressForBleInput() &&
+      mappedInput.wasReleased(MappedInputManager::Button::Back) && backHeldMs < goHomeMs) {
     activityManager.goHome();
     return;
   }

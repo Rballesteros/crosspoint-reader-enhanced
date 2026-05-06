@@ -21,7 +21,7 @@ void ActivityManager::begin() {
   xTaskCreate(&renderTaskTrampoline, "ActivityManagerRender",
               8192,              // Stack size
               this,              // Parameters
-              3,                 // Priority: Higher priority than the default loop to ensure responsive rendering
+              1,                 // Priority: keep at 1 — raising starves IDF timer / SD helpers and trips the watchdog on single-core C3
               &renderTaskHandle  // Task handle
   );
   assert(renderTaskHandle != nullptr && "Failed to create render task");
@@ -87,6 +87,10 @@ void ActivityManager::loop() {
         currentActivity = std::move(stackActivities.back());
         stackActivities.pop_back();
         LOG_DBG("ACT", "Popped from activity stack, new size = %zu", stackActivities.size());
+
+        // Notify activity it is back in foreground
+        currentActivity->onResume();
+
         // Handle result if necessary
         if (currentActivity->resultHandler) {
           LOG_DBG("ACT", "Handling result for popped activity");
@@ -121,6 +125,7 @@ void ActivityManager::loop() {
         }
       } else if (pendingAction == PendingAction::Push) {
         // Move current activity to stack
+        currentActivity->onPause();
         stackActivities.push_back(std::move(currentActivity));
         LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
       }
