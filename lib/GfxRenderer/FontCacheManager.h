@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 
 class FontDecompressor;
 
@@ -21,7 +22,7 @@ class FontCacheManager {
 
   // Scan-mode API: called by GfxRenderer::drawText() during scan pass
   bool isScanning() const;
-  void recordText(const char* text, int fontId, EpdFontFamily::Style style);
+  void recordText(std::string_view text, int fontId, EpdFontFamily::Style style);
 
   // The FontDecompressor pointer, needed by GfxRenderer::getGlyphBitmap()
   FontDecompressor* getDecompressor() const { return fontDecompressor_; }

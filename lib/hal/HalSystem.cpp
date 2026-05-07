@@ -118,6 +118,7 @@ std::string getPanicInfo(bool full) {
     info += "CrossPoint version: " CROSSPOINT_VERSION;
     info += "\n\nPanic reason: " + std::string(panicMessage);
     info += "\n\nLast logs:\n" + getLastLogs();
+    info += "\n\nHeap history:\n" + getHeapHistory();
     info += "\n\nStack memory:\n";
 
     auto toHex = [](uint32_t value) {

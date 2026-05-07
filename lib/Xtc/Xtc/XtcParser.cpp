@@ -516,14 +516,14 @@ XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
 
   while (totalRead < bitmapSize) {
     size_t toRead = std::min(chunkSize, bitmapSize - totalRead);
-    size_t bytesRead = m_file.read(chunk.data(), toRead);
+    int bytesRead = m_file.read(chunk.data(), toRead);
 
-    if (bytesRead == 0) {
+    if (bytesRead <= 0) {
       return XtcError::READ_ERROR;
     }
 
-    callback(chunk.data(), bytesRead, totalRead);
-    totalRead += bytesRead;
+    callback(chunk.data(), static_cast<size_t>(bytesRead), totalRead);
+    totalRead += static_cast<size_t>(bytesRead);
   }
 
   return XtcError::OK;

@@ -5,6 +5,7 @@
 #include <JPEGDEC.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -164,6 +165,19 @@ namespace {
 constexpr int MAX_MCU_HEIGHT = 16;
 constexpr size_t JPEG_DECODER_SIZE = 20 * 1024;
 constexpr size_t MIN_FREE_HEAP = JPEG_DECODER_SIZE + 32 * 1024;
+constexpr size_t BMP_CONVERT_SAFETY_MARGIN = 24 * 1024;
+
+bool hasHeapForBmpConvert(const size_t totalBytes, const size_t largestBlock, const char* label) {
+  const size_t freeHeap = ESP.getFreeHeap();
+  const size_t maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap < totalBytes + BMP_CONVERT_SAFETY_MARGIN || maxAlloc < largestBlock) {
+    LOG_DBG("JPG", "Skipping %s: free=%u maxAlloc=%u needFree=%u needBlock=%u", label,
+            static_cast<unsigned>(freeHeap), static_cast<unsigned>(maxAlloc),
+            static_cast<unsigned>(totalBytes + BMP_CONVERT_SAFETY_MARGIN), static_cast<unsigned>(largestBlock));
+    return false;
+  }
+  return true;
+}
 
 // Static file pointer for JPEGDEC open callback.
 // Safe in single-threaded embedded context; never accessed concurrently.
@@ -472,8 +486,31 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   ctx.scaleY_fp = scaleY_fp;
   ctx.error = false;
 
+  const size_t mcuBytes = static_cast<size_t>(MAX_MCU_HEIGHT) * static_cast<size_t>(srcWidth);
+  const size_t bmpRowBytes = static_cast<size_t>(bytesPerRow);
+  const size_t rowAccumBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint32_t) : 0;
+  const size_t rowCountBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint32_t) : 0;
+  const size_t ditherBytes = USE_8BIT_OUTPUT
+                                 ? 0
+                                 : (oneBit || USE_ATKINSON
+                                        ? static_cast<size_t>(outWidth + 4) * sizeof(int16_t) * 3
+                                        : (USE_FLOYD_STEINBERG
+                                               ? static_cast<size_t>(outWidth + 2) * sizeof(int16_t) * 2
+                                               : 0));
+  size_t largestBlock = std::max(mcuBytes, bmpRowBytes);
+  largestBlock = std::max(largestBlock, rowAccumBytes);
+  largestBlock = std::max(largestBlock, rowCountBytes);
+  largestBlock = std::max(largestBlock, ditherBytes / 2 + sizeof(int16_t) * 4);
+  const size_t totalWorkingBytes = mcuBytes + bmpRowBytes + rowAccumBytes + rowCountBytes + ditherBytes;
+  if (!hasHeapForBmpConvert(totalWorkingBytes, largestBlock, "JPEG BMP buffers")) {
+    jpeg->close();
+    delete jpeg;
+    s_jpegFile = nullptr;
+    return false;
+  }
+
   // MCU row buffer: MAX_MCU_HEIGHT rows × srcWidth columns of grayscale
-  ctx.mcuBuf.assign(MAX_MCU_HEIGHT * srcWidth, 0);
+  ctx.mcuBuf.assign(mcuBytes, 0);
 
   ctx.bmpRow.assign(bytesPerRow, 0);
 
@@ -484,12 +521,33 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   }
 
   if (oneBit) {
-    ctx.atkinson1BitDitherer = std::make_unique<Atkinson1BitDitherer>(outWidth);
+    ctx.atkinson1BitDitherer.reset(new (std::nothrow) Atkinson1BitDitherer(outWidth));
+    if (!ctx.atkinson1BitDitherer) {
+      LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate 1-bit ditherer");
+      jpeg->close();
+      delete jpeg;
+      s_jpegFile = nullptr;
+      return false;
+    }
   } else if (!USE_8BIT_OUTPUT) {
     if (USE_ATKINSON) {
-      ctx.atkinsonDitherer = std::make_unique<AtkinsonDitherer>(outWidth);
+      ctx.atkinsonDitherer.reset(new (std::nothrow) AtkinsonDitherer(outWidth));
+      if (!ctx.atkinsonDitherer) {
+        LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate Atkinson ditherer");
+        jpeg->close();
+        delete jpeg;
+        s_jpegFile = nullptr;
+        return false;
+      }
     } else if (USE_FLOYD_STEINBERG) {
-      ctx.fsDitherer = std::make_unique<FloydSteinbergDitherer>(outWidth);
+      ctx.fsDitherer.reset(new (std::nothrow) FloydSteinbergDitherer(outWidth));
+      if (!ctx.fsDitherer) {
+        LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate Floyd-Steinberg ditherer");
+        jpeg->close();
+        delete jpeg;
+        s_jpegFile = nullptr;
+        return false;
+      }
     }
   }
 
@@ -497,11 +555,13 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   jpeg->setUserPointer(&ctx);
 
   rc = jpeg->decode(0, 0, 0);
+  const int decodeError = jpeg->getLastError();
   jpeg->close();
   delete jpeg;
+  s_jpegFile = nullptr;
 
   if (rc != 1 || ctx.error) {
-    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, jpeg->getLastError());
+    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, decodeError);
     return false;
   }
 

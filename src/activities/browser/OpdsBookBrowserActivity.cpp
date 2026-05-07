@@ -5,6 +5,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <OpdsStream.h>
+#include <BluetoothHIDManager.h>
 #include <WiFi.h>
 
 #include "MappedInputManager.h"

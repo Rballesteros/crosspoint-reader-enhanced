@@ -4,6 +4,7 @@
 #include <ESPmDNS.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <BluetoothHIDManager.h>
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
@@ -141,7 +142,18 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   if (mode == NetworkMode::JOIN_NETWORK) {
     // STA mode - launch WiFi selection
     LOG_DBG("WEBACT", "Turning on WiFi (STA mode)...");
+
+    // Keep this firmware path to one active radio stack at a time so web
+    // activity startup has a predictable heap budget on the ESP32-C3.
+    auto& btMgr = BluetoothHIDManager::getInstance();
+    if (btMgr.isEnabled()) {
+      LOG_INF("WEBACT", "Disabling Bluetooth before WiFi startup");
+      btMgr.disable();
+      delay(100);  // Brief delay to ensure BLE radio is fully down
+    }
+
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(true);  // Enable modem sleep for battery saving
 
     state = WebServerActivityState::WIFI_SELECTION;
     LOG_DBG("WEBACT", "Launching WifiSelectionActivity...");
@@ -194,6 +206,15 @@ void CrossPointWebServerActivity::onWifiSelectionComplete(const bool connected) 
 void CrossPointWebServerActivity::startAccessPoint() {
   LOG_DBG("WEBACT", "Starting Access Point mode...");
   LOG_DBG("WEBACT", "Free heap before AP start: %d bytes", ESP.getFreeHeap());
+
+  // Keep this firmware path to one active radio stack at a time so AP startup
+  // has a predictable heap budget on the ESP32-C3.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    LOG_INF("WEBACT", "Disabling Bluetooth before WiFi AP startup");
+    btMgr.disable();
+    delay(100);  // Brief delay to ensure BLE radio is fully down
+  }
 
   // Configure and start the AP
   WiFi.mode(WIFI_AP);

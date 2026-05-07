@@ -3,6 +3,7 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <BluetoothHIDManager.h>
 #include <WiFi.h>
 
 #include <map>
@@ -215,8 +216,18 @@ void WifiSelectionActivity::attemptConnection() {
   connectionError.clear();
   requestUpdate();
 
+  // Keep this firmware path to one active radio stack at a time so WiFi
+  // connection setup has a predictable heap budget on the ESP32-C3.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    LOG_INF("WiFi", "Disabling Bluetooth before WiFi startup");
+    btMgr.disable();
+    delay(100);  // Brief delay to ensure BLE radio is fully down
+  }
+
   WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore; suppress SDK NVS auto-connect
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);  // Enable modem sleep for battery saving
   WiFi.disconnect(true, true);  // Abort any in-progress SDK auto-connect and clear NVS-saved SSID
   delay(100);
 

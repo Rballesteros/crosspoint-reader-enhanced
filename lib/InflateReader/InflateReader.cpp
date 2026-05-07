@@ -1,5 +1,9 @@
 #include "InflateReader.h"
 
+#include <HeapBudget.h>
+#include <Logging.h>
+#include <esp_heap_caps.h>
+
 #include <cstring>
 #include <type_traits>
 
@@ -18,16 +22,28 @@ bool InflateReader::init(const bool streaming, size_t dictSize) {
 
   if (streaming) {
     if (dictSize == 0) dictSize = INFLATE_DICT_SIZE;
-    ringBuffer.assign(dictSize, 0);
+    constexpr size_t SAFETY_MARGIN = 16 * 1024;
+    if (!HeapBudget::canAllocate(dictSize, dictSize, SAFETY_MARGIN, "INF", "inflate ring buffer")) {
+      return false;
+    }
+    ringBuffer = static_cast<uint8_t*>(heap_caps_calloc(dictSize, 1, MALLOC_CAP_8BIT));
+    if (!ringBuffer) {
+      LOG_DBG("INF", "Failed to allocate inflate ring buffer (%u bytes)", static_cast<unsigned>(dictSize));
+      return false;
+    }
+    ringBufferSize = dictSize;
   }
 
-  uzlib_uncompress_init(&decomp, ringBuffer.empty() ? nullptr : ringBuffer.data(), ringBuffer.size());
+  uzlib_uncompress_init(&decomp, ringBuffer, ringBufferSize);
   return true;
 }
 
 void InflateReader::deinit() {
-  ringBuffer.clear();
-  ringBuffer.shrink_to_fit();
+  if (ringBuffer) {
+    heap_caps_free(ringBuffer);
+    ringBuffer = nullptr;
+  }
+  ringBufferSize = 0;
   memset(&decomp, 0, sizeof(decomp));
 }
 
@@ -44,7 +60,7 @@ void InflateReader::skipZlibHeader() {
 }
 
 bool InflateReader::read(uint8_t* dest, size_t len) {
-  if (ringBuffer.empty()) {
+  if (ringBufferSize == 0) {
     // One-shot mode: back-references use absolute offset from dest_start.
     // Valid only when read() is called once with the full output buffer.
     decomp.dest_start = dest;
@@ -58,7 +74,7 @@ bool InflateReader::read(uint8_t* dest, size_t len) {
 }
 
 InflateStatus InflateReader::readAtMost(uint8_t* dest, size_t maxLen, size_t* produced) {
-  if (ringBuffer.empty()) {
+  if (ringBufferSize == 0) {
     // One-shot mode: back-references use absolute offset from dest_start.
     // Valid only when readAtMost() is called once with the full output buffer.
     decomp.dest_start = dest;

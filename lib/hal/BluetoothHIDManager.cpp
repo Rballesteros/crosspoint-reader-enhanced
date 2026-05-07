@@ -341,6 +341,11 @@ BluetoothHIDManager& BluetoothHIDManager::getInstance() {
   return *g_instance;
 }
 
+unsigned long BluetoothHIDManager::lastDisconnectTime() const {
+  StateLock lock(_stateMutex);
+  return _lastDisconnectTime;
+}
+
 BluetoothHIDManager::BluetoothHIDManager() {
   LOG_DBG("BT", "BluetoothHIDManager constructor");
   _stateMutex = xSemaphoreCreateMutex();
@@ -440,10 +445,10 @@ bool BluetoothHIDManager::enable() {
 
   LOG_INF("BT", "Enabling Bluetooth...");
 
-  // CRITICAL: Disable WiFi when enabling Bluetooth
-  // ESP32-C3 cannot have both WiFi and BLE enabled simultaneously
+  // Keep this firmware path to one active radio stack at a time so the heap
+  // budget and radio state remain predictable on the ESP32-C3.
   if (WiFi.getMode() != WIFI_OFF) {
-    LOG_INF("BT", "Disabling WiFi to enable Bluetooth (mutual exclusion)");
+    LOG_INF("BT", "Disabling WiFi before Bluetooth startup");
     WiFi.disconnect(true);  // true = turn off WiFi radio
     WiFi.mode(WIFI_OFF);
     delay(100);  // Brief delay to ensure WiFi is fully powered down
@@ -640,7 +645,14 @@ void BluetoothHIDManager::stopScan() {
 void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice) {
   if (!advertisedDevice) return;
 
-  std::string address = advertisedDevice->getAddress().toString();
+  struct PayloadClearGuard {
+    NimBLEAdvertisedDevice* device;
+    ~PayloadClearGuard() { device->clearPayload(); }
+  } clearGuard{advertisedDevice};
+
+  char addressBuf[18];
+  advertisedDevice->getAddress().toChars(addressBuf);
+  std::string address(addressBuf);
   {
     StateLock lock(_stateMutex);
     if (_bondedOnlyScan && address != _bondedDeviceAddress) {
@@ -831,7 +843,7 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address, uint8_t ad
   pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
   pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY, BLE_CONN_TIMEOUT,
                                BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-  pClient->setClientCallbacks(&clientCallbacks);
+  pClient->setClientCallbacks(&clientCallbacks, false);
 
   if (!pClient->isConnected() && !hadExistingClient) {
     pClient->deleteServices();
@@ -851,7 +863,7 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address, uint8_t ad
         pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
         pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
                                      BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-        pClient->setClientCallbacks(&clientCallbacks);
+        pClient->setClientCallbacks(&clientCallbacks, false);
       }
     }
 

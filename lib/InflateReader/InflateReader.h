@@ -3,7 +3,7 @@
 #include <uzlib.h>
 
 #include <cstddef>
-#include <vector>
+#include <cstdint>
 
 // Return value for readAtMost().
 enum class InflateStatus {
@@ -81,5 +81,6 @@ class InflateReader {
 
  private:
   uzlib_uncomp decomp = {};
-  std::vector<uint8_t> ringBuffer;
+  uint8_t* ringBuffer = nullptr;
+  size_t ringBufferSize = 0;
 };

@@ -141,8 +141,8 @@ struct DirectCacheWriter {
   int originX = 0;
   uint8_t* rowPtr = nullptr;  // Pre-computed for current row
 
-  void init(std::vector<uint8_t>& cacheBuffer, int cacheBytesPerRow, int cacheOriginX) {
-    buffer = cacheBuffer.data();
+  void init(uint8_t* cacheBuffer, int cacheBytesPerRow, int cacheOriginX) {
+    buffer = cacheBuffer;
     bytesPerRow = cacheBytesPerRow;
     originX = cacheOriginX;
     rowPtr = nullptr;

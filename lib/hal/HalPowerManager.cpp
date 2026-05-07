@@ -125,25 +125,30 @@ uint16_t HalPowerManager::getBatteryPercentage() const {
 
 HalPowerManager::Lock::Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
-  // Current limitation: only one lock at a time
-  if (powerManager.currentLockMode != None) {
-    LOG_ERR("PWR", "Lock already held, ignore");
-    valid = false;
-  } else {
+  if (powerManager.lockCount == 0) {
     powerManager.currentLockMode = NormalSpeed;
     valid = true;
+  } else {
+    // Already at normal speed, just increment counter
+    valid = true;
   }
+  powerManager.lockCount++;
   xSemaphoreGive(powerManager.modeMutex);
-  if (valid) {
-    // Immediately restore normal CPU frequency if currently in low-power mode
+
+  if (powerManager.currentLockMode == NormalSpeed) {
+    // Immediately restore normal CPU frequency if currently in low-power mode.
+    // Safe to call even if already at normal frequency.
     powerManager.setPowerSaving(false);
   }
 }
 
 HalPowerManager::Lock::~Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
-  if (valid) {
-    powerManager.currentLockMode = None;
+  if (valid && powerManager.lockCount > 0) {
+    powerManager.lockCount--;
+    if (powerManager.lockCount == 0) {
+      powerManager.currentLockMode = None;
+    }
   }
   xSemaphoreGive(powerManager.modeMutex);
 }

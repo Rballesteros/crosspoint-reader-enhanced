@@ -166,6 +166,12 @@ class BaseTheme {
 
   // Shared constants and helpers for battery drawing (used by all themes)
   static constexpr int batteryPercentSpacing = 4;
+  static constexpr int bluetoothStatusWidth = 21;
+  static constexpr int bluetoothStatusHeight = 14;
+  static constexpr int bluetoothStatusSpacing = 6;
   static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight);
   static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY);
+  static bool showBluetoothStatusIndicator();
+  static bool isBluetoothStatusConnected();
+  static void drawBluetoothStatusIcon(const GfxRenderer& renderer, int x, int y, bool connected);
 };

@@ -26,6 +26,7 @@ class EpubReaderMenuActivity final : public Activity {
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
+                                  const std::string& chapterTitle, int chapterNumber, int chapterCount,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
                                   const uint8_t currentOrientation, const bool hasFootnotes);
 
@@ -55,6 +56,9 @@ class EpubReaderMenuActivity final : public Activity {
   const std::vector<StrId> orientationLabels = {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_INVERTED,
                                                 StrId::STR_LANDSCAPE_CCW};
   const std::vector<const char*> pageTurnLabels = {I18N.get(StrId::STR_STATE_OFF), "1", "3", "6", "12"};
+  std::string chapterTitle;
+  int chapterNumber = 0;
+  int chapterCount = 0;
   int currentPage = 0;
   int totalPages = 0;
   int bookProgressPercent = 0;

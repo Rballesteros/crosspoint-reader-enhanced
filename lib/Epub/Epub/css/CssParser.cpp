@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <Logging.h>
 
+#include <esp_heap_caps.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -45,12 +47,40 @@ constexpr size_t MAX_RULES = 1500;
 // If below this threshold, we skip CSS to avoid display artifacts.
 constexpr size_t MIN_FREE_HEAP_FOR_CSS = 48 * 1024;
 
+// Loading the CSS cache builds an unordered_map node for every selector. CSS is
+// optional, so skip it before fragmentation turns a failed allocation into an abort.
+constexpr size_t MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD = 40 * 1024;
+constexpr size_t MIN_LARGEST_BLOCK_FOR_CSS_CACHE_LOAD = 16 * 1024;
+constexpr size_t MIN_FREE_HEAP_FOR_CSS_RULE_INSERT = 32 * 1024;
+constexpr size_t MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT = 1 * 1024;
+constexpr uint16_t CSS_CACHE_HEAP_CHECK_INTERVAL = 8;
+
 // Maximum length for a single selector string
 // Prevents parsing of extremely long or malformed selectors
 constexpr size_t MAX_SELECTOR_LENGTH = 256;
 
 // Check if character is CSS whitespace
 bool isCssWhitespace(const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+
+struct HeapSnapshot {
+  size_t free = 0;
+  size_t largest = 0;
+};
+
+HeapSnapshot cssHeapSnapshot() {
+  HeapSnapshot snapshot;
+  snapshot.free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  snapshot.largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  return snapshot;
+}
+
+bool hasCssHeapHeadroom(const size_t minFree, const size_t minLargest, HeapSnapshot* snapshot = nullptr) {
+  const HeapSnapshot current = cssHeapSnapshot();
+  if (snapshot != nullptr) {
+    *snapshot = current;
+  }
+  return current.free >= minFree && current.largest >= minLargest;
+}
 
 std::string_view stripTrailingImportant(std::string_view value) {
   constexpr std::string_view IMPORTANT = "!important";
@@ -414,7 +444,10 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
           auto existing = rulesBySelector_.find(targetElement);
           if (existing != rulesBySelector_.end()) {
             existing->second.applyOver(style);
-          } else {
+          } else if (rulesBySelector_.size() < MAX_RULES) {
+            // Only insert new combinator-derived rules when under the limit; this
+            // prevents heavily-stylized EPUBs from blowing past MAX_RULES via
+            // descendant selectors.
             rulesBySelector_[targetElement] = style;
           }
         }
@@ -787,6 +820,21 @@ bool CssParser::loadFromCache() {
     return false;
   }
 
+  HeapSnapshot heapBefore;
+  if (ruleCount > 0 &&
+      !hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD, MIN_LARGEST_BLOCK_FOR_CSS_CACHE_LOAD, &heapBefore)) {
+    LOG_DBG("CSS",
+            "Skipping CSS cache load under low heap: rules=%u free=%u maxAlloc=%u needFree=%u needBlock=%u",
+            ruleCount, static_cast<unsigned>(heapBefore.free), static_cast<unsigned>(heapBefore.largest),
+            static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD),
+            static_cast<unsigned>(MIN_LARGEST_BLOCK_FOR_CSS_CACHE_LOAD));
+    return true;
+  }
+
+  if (ruleCount > 0) {
+    rulesBySelector_.reserve(ruleCount);
+  }
+
   auto hasRemainingBytes = [&file](const size_t neededBytes) -> bool {
     return static_cast<size_t>(file.available()) >= neededBytes;
   };
@@ -798,6 +846,20 @@ bool CssParser::loadFromCache() {
 
   // Read each rule
   for (uint16_t i = 0; i < ruleCount; ++i) {
+    if (i % CSS_CACHE_HEAP_CHECK_INTERVAL == 0) {
+      HeapSnapshot heapDuring;
+      if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT,
+                              &heapDuring)) {
+        LOG_DBG("CSS",
+                "Stopping CSS cache load under low heap: loaded=%u/%u free=%u maxAlloc=%u needFree=%u needBlock=%u",
+                i, ruleCount, static_cast<unsigned>(heapDuring.free), static_cast<unsigned>(heapDuring.largest),
+                static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT),
+                static_cast<unsigned>(MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT));
+        rulesBySelector_.clear();
+        return true;
+      }
+    }
+
     // Read selector string
     uint16_t selectorLen = 0;
     if (!hasRemainingBytes(sizeof(selectorLen))) {
@@ -813,6 +875,16 @@ bool CssParser::loadFromCache() {
       LOG_DBG("CSS", "Invalid selector length in cache: %u", selectorLen);
       rulesBySelector_.clear();
       return false;
+    }
+
+    HeapSnapshot heapForSelector;
+    if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, selectorLen + 128, &heapForSelector)) {
+      LOG_DBG("CSS",
+              "Stopping CSS cache load before selector allocation: loaded=%u/%u free=%u maxAlloc=%u selector=%u",
+              i, ruleCount, static_cast<unsigned>(heapForSelector.free), static_cast<unsigned>(heapForSelector.largest),
+              selectorLen);
+      rulesBySelector_.clear();
+      return true;
     }
 
     std::string selector;
@@ -908,7 +980,15 @@ bool CssParser::loadFromCache() {
     style.defined.imageWidth = (definedBits & 1 << 14) != 0;
     style.defined.display = (definedBits & 1 << 15) != 0;
 
-    rulesBySelector_[selector] = style;
+    HeapSnapshot heapForRule;
+    if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT, &heapForRule)) {
+      LOG_DBG("CSS", "Stopping CSS cache load before rule insert: loaded=%u/%u free=%u maxAlloc=%u", i, ruleCount,
+              static_cast<unsigned>(heapForRule.free), static_cast<unsigned>(heapForRule.largest));
+      rulesBySelector_.clear();
+      return true;
+    }
+
+    rulesBySelector_.emplace(std::move(selector), style);
   }
 
   LOG_DBG("CSS", "Loaded %u rules from cache", ruleCount);

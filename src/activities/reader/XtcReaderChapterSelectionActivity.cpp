@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -56,13 +57,13 @@ void XtcReaderChapterSelectionActivity::loop() {
   const int pageItems = getPageItems();
   const int totalItems = static_cast<int>(xtc->getChapters().size());
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
     const auto& chapters = xtc->getChapters();
     if (!chapters.empty() && selectorIndex >= 0 && selectorIndex < static_cast<int>(chapters.size())) {
       setResult(PageResult{chapters[selectorIndex].startPage});
       finish();
     }
-  } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+  } else if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
     setResult(std::move(result));

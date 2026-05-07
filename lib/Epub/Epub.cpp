@@ -2,10 +2,18 @@
 
 #include <FsHelpers.h>
 #include <HalStorage.h>
+#include <HeapBudget.h>
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
 #include <PngToBmpConverter.h>
 #include <ZipFile.h>
+
+#include <esp_heap_caps.h>
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <new>
 
 #include "Epub/parsers/ContainerParser.h"
 #include "Epub/parsers/ContentOpfParser.h"
@@ -82,10 +90,49 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
   // try extracting the image reference from the guide's cover page XHTML
   if (bookMetadata.coverItemHref.empty() && !opfParser.guideCoverPageHref.empty()) {
     LOG_DBG("EBP", "No cover from metadata, trying guide cover page: %s", opfParser.guideCoverPageHref.c_str());
-    const auto coverPageData = readItemContentsToBytes(opfParser.guideCoverPageHref, true);
-    if (!coverPageData.empty()) {
-      const std::string_view coverPageHtml(reinterpret_cast<const char*>(coverPageData.data()), coverPageData.size());
 
+    std::unique_ptr<char[]> coverPageHtmlBuffer;
+    std::string_view coverPageHtml;
+    size_t fileSize = 0;
+    if (getItemSize(opfParser.guideCoverPageHref, &fileSize)) {
+      // Up to 32KB is too large for the ESP32-C3 stack; allocate once and skip
+      // this optional fallback if the heap safety margin is not available.
+      static constexpr size_t COVER_PAGE_SCAN_LIMIT = 32 * 1024;
+      static constexpr size_t COVER_PAGE_HEAP_SAFETY_MARGIN = 8 * 1024;
+      const size_t toRead = std::min(fileSize, COVER_PAGE_SCAN_LIMIT);
+      if (toRead > 0 &&
+          HeapBudget::canAllocate(toRead, toRead, COVER_PAGE_HEAP_SAFETY_MARGIN, "EBP", "cover page scan buffer")) {
+        coverPageHtmlBuffer.reset(new (std::nothrow) char[toRead]);
+        if (!coverPageHtmlBuffer) {
+          LOG_ERR("EBP", "Could not allocate cover page scan buffer (%u bytes)", static_cast<unsigned>(toRead));
+        } else {
+          // We do not have a direct "read partial to memory" stream target, so
+          // stream to a temporary cache file and inspect only the bounded prefix.
+          const auto tmpPath = getCachePath() + "/.tmp_cv.html";
+          FsFile tmpFile;
+          if (Storage.openFileForWrite("EBP", tmpPath, tmpFile)) {
+            if (!readItemContentsToStream(opfParser.guideCoverPageHref, tmpFile, 1024)) {
+              LOG_ERR("EBP", "Could not extract guide cover page");
+            }
+            tmpFile.close();
+            if (Storage.openFileForRead("EBP", tmpPath, tmpFile)) {
+              const int bytesRead = tmpFile.read(coverPageHtmlBuffer.get(), toRead);
+              if (bytesRead > 0) {
+                coverPageHtml = std::string_view(coverPageHtmlBuffer.get(), static_cast<size_t>(bytesRead));
+              }
+              tmpFile.close();
+            }
+            Storage.remove(tmpPath.c_str());
+          }
+        }
+      } else if (toRead > 0) {
+        LOG_DBG("EBP", "Skipping guide cover scan under low heap (%u bytes requested)", static_cast<unsigned>(toRead));
+      }
+    } else {
+      LOG_ERR("EBP", "Could not get size of guide cover page");
+    }
+
+    if (!coverPageHtml.empty()) {
       // Determine base path of the cover page for resolving relative image references
       std::string coverPageBase;
       const auto lastSlash = opfParser.guideCoverPageHref.rfind('/');
@@ -243,7 +290,9 @@ void Epub::parseCssFiles() const {
   // Larger files risk memory exhaustion on ESP32
   constexpr size_t MAX_CSS_FILE_SIZE = 128 * 1024;  // 128KB
   // Minimum heap required before attempting CSS parsing
-  constexpr size_t MIN_HEAP_FOR_CSS_PARSING = 64 * 1024;  // 64KB
+  constexpr size_t MIN_HEAP_FOR_CSS_PARSING = 48 * 1024;  // 48KB
+  constexpr size_t MIN_CSS_PARSE_BLOCK = 8 * 1024;
+  bool skippedForLowHeap = false;
 
   if (cssFiles.empty()) {
     LOG_DBG("EBP", "No CSS files to parse, but CssParser created for inline styles");
@@ -262,10 +311,8 @@ void Epub::parseCssFiles() const {
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
     // Check heap before parsing - CSS parsing allocates heavily
-    const uint32_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < MIN_HEAP_FOR_CSS_PARSING) {
-      LOG_ERR("EBP", "Insufficient heap for CSS parsing (%u bytes free, need %zu), skipping: %s", freeHeap,
-              MIN_HEAP_FOR_CSS_PARSING, cssPath.c_str());
+    if (!HeapBudget::canAllocate(MIN_HEAP_FOR_CSS_PARSING, MIN_CSS_PARSE_BLOCK, 0, "EBP", cssPath.c_str())) {
+      skippedForLowHeap = true;
       continue;
     }
 
@@ -309,6 +356,12 @@ void Epub::parseCssFiles() const {
   }
 
   // Save to cache for next time
+  if (skippedForLowHeap) {
+    LOG_DBG("EBP", "CSS parsing skipped or incomplete under low heap; not caching partial CSS rules");
+    cssParser->clear();
+    return;
+  }
+
   if (!cssParser->saveToCache()) {
     LOG_ERR("EBP", "Failed to save CSS rules to cache");
   }
@@ -865,6 +918,8 @@ int Epub::resolveHrefToSpineIndex(std::string_view href) const {
 
   for (int i = 0; i < getSpineItemsCount(); i++) {
     const auto& spineHref = getSpineItem(i).href;
+    // Exact-match short-circuit avoids the slash-split + substr work for the common case.
+    if (spineHref == target) return i;
     // Then filename-only match
     size_t spineSlash = spineHref.find_last_of('/');
     std::string_view spineFilename =

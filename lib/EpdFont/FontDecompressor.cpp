@@ -3,8 +3,24 @@
 #include <Arduino.h>
 #include <Logging.h>
 #include <Utf8.h>
+#include <esp_heap_caps.h>
 
+#include <algorithm>
 #include <cstdlib>
+
+namespace {
+constexpr size_t FONT_ALLOC_SAFETY_MARGIN = 8 * 1024;
+constexpr size_t FONT_PREWARM_SAFETY_MARGIN = 16 * 1024;
+constexpr size_t FONT_PREWARM_FRAGMENTATION_MARGIN = 8 * 1024;
+
+bool hasHeapForAllocation(const size_t bytes, const size_t safetyMargin = FONT_ALLOC_SAFETY_MARGIN) {
+  if (bytes == 0) return true;
+
+  const size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  return freeHeap >= bytes + safetyMargin && largestBlock >= bytes;
+}
+}  // namespace
 
 FontDecompressor::~FontDecompressor() { deinit(); }
 
@@ -192,8 +208,20 @@ const uint8_t* FontDecompressor::getBitmap(const EpdFontData* fontData, const Ep
     // Use the next slot in the MRU ring
     hotGroupMruIdx = (hotGroupMruIdx + 1) % MAX_HOT_GROUPS;
     HotGroup& slot = hotGroups[hotGroupMruIdx];
-    
+
     const EpdFontGroup& group = fontData->groups[groupIndex];
+    if (slot.data.capacity() < group.uncompressedSize && !hasHeapForAllocation(group.uncompressedSize)) {
+      LOG_DBG("FDC", "Skipping hot group %u allocation: free=%u maxAlloc=%u need=%u", groupIndex,
+              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(group.uncompressedSize));
+      slot.data.clear();
+      slot.groupIndex = UINT16_MAX;
+      slot.fontData = nullptr;
+      stats.getBitmapTimeUs += micros() - tStart;
+      return nullptr;
+    }
+
     slot.data.assign(group.uncompressedSize, 0);
 
     if (!decompressGroup(fontData, groupIndex, slot.data.data(), group.uncompressedSize)) {
@@ -213,6 +241,14 @@ const uint8_t* FontDecompressor::getBitmap(const EpdFontData* fontData, const Ep
 
   // Compact just the requested glyph from byte-aligned data into scratch buffer
   if (glyph->dataLength > hotGlyphBuf.size()) {
+    if (hotGlyphBuf.capacity() < glyph->dataLength && !hasHeapForAllocation(glyph->dataLength)) {
+      LOG_DBG("FDC", "Skipping glyph scratch allocation: free=%u maxAlloc=%u need=%u",
+              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(glyph->dataLength));
+      stats.getBitmapTimeUs += micros() - tStart;
+      return nullptr;
+    }
     hotGlyphBuf.resize(glyph->dataLength);
   }
   if (hotGlyphBuf.empty()) {
@@ -327,6 +363,28 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, std::string_view
   stats.uniqueGroupsAccessed = groupCount;
 
   // Step 3: Allocate page buffer and lookup table for this slot
+  uint32_t peakTempBytes = 0;
+  for (uint8_t g = 0; g < groupCount; g++) {
+    peakTempBytes = std::max(peakTempBytes, fontData->groups[neededGroups[g]].uncompressedSize);
+  }
+
+  const size_t glyphEntriesBytes = glyphCount * sizeof(PageGlyphEntry);
+  const size_t prewarmWorkingSet = static_cast<size_t>(totalBytes) + glyphEntriesBytes + peakTempBytes;
+  const size_t largestNeeded =
+      std::max({static_cast<size_t>(totalBytes), glyphEntriesBytes, static_cast<size_t>(peakTempBytes)}) +
+      FONT_PREWARM_FRAGMENTATION_MARGIN;
+  const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (freeBefore < prewarmWorkingSet + FONT_PREWARM_SAFETY_MARGIN || largestBefore < largestNeeded) {
+    LOG_DBG("FDC",
+            "Skipping prewarm: free=%u maxAlloc=%u needFree=%u needBlock=%u glyphs=%u groups=%u pageBuf=%u peakTemp=%u",
+            static_cast<unsigned>(freeBefore), static_cast<unsigned>(largestBefore),
+            static_cast<unsigned>(prewarmWorkingSet + FONT_PREWARM_SAFETY_MARGIN),
+            static_cast<unsigned>(largestNeeded), glyphCount, groupCount, static_cast<unsigned>(totalBytes),
+            static_cast<unsigned>(peakTempBytes));
+    return glyphCount;
+  }
+
   slot.buffer.resize(totalBytes);
   slot.glyphs.resize(glyphCount);
   if (slot.buffer.empty() && totalBytes > 0) {
@@ -428,9 +486,11 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, std::string_view
     uint16_t groupIdx = neededGroups[g];
     const EpdFontGroup& group = fontData->groups[groupIdx];
 
-    std::vector<uint8_t> tempBuf(group.uncompressedSize);
-    if (tempBuf.empty() && group.uncompressedSize > 0) {
-      LOG_ERR("FDC", "Failed to allocate temp buffer (%u bytes) for group %u", group.uncompressedSize, groupIdx);
+    auto* tempBuf = static_cast<uint8_t*>(heap_caps_malloc(group.uncompressedSize, MALLOC_CAP_8BIT));
+    if (!tempBuf && group.uncompressedSize > 0) {
+      LOG_DBG("FDC", "Failed to allocate temp buffer (%u bytes) for group %u, free=%u maxAlloc=%u",
+              group.uncompressedSize, groupIdx, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
       missed++;
       continue;
     }
@@ -438,7 +498,8 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, std::string_view
       stats.peakTempBytes = group.uncompressedSize;
     }
 
-    if (!decompressGroup(fontData, groupIdx, tempBuf.data(), group.uncompressedSize)) {
+    if (!decompressGroup(fontData, groupIdx, tempBuf, group.uncompressedSize)) {
+      heap_caps_free(tempBuf);
       missed++;
       continue;
     }
@@ -454,6 +515,8 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, std::string_view
       slot.glyphs[i].bufferOffset = writeOffset;
       writeOffset += glyph.dataLength;
     }
+
+    heap_caps_free(tempBuf);
   }
 
   LOG_DBG("FDC", "Prewarm: %u glyphs in %u bytes from %u groups (%d missed)", glyphCount, writeOffset, groupCount,

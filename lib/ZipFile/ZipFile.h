@@ -2,9 +2,9 @@
 #include <HalStorage.h>
 
 #include <deque>
+#include <map>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 class ZipFile {
@@ -43,7 +43,9 @@ class ZipFile {
   const std::string& filePath;
   FsFile file;
   ZipDetails zipDetails = {0, 0, false};
-  std::unordered_map<std::string, FileStatSlim> fileStatSlimCache;
+  // Use std::map with transparent comparator so we can lookup with std::string_view
+  // without allocating a temporary std::string per call (was a hot-path heap churn).
+  std::map<std::string, FileStatSlim, std::less<>> fileStatSlimCache;
 
   // Cursor for sequential central-dir scanning optimization
   uint32_t lastCentralDirPos = 0;

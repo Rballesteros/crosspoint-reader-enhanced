@@ -4,17 +4,22 @@
 #include <I18n.h>
 
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                               const std::string& title, const int currentPage, const int totalPages,
-                                               const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes)
+                                               const std::string& title, const std::string& chapterTitle,
+                                               const int chapterNumber, const int chapterCount, const int currentPage,
+                                               const int totalPages, const int bookProgressPercent,
+                                               const uint8_t currentOrientation, const bool hasFootnotes)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes)),
       title(title),
       pendingOrientation(currentOrientation),
+      chapterTitle(chapterTitle),
+      chapterNumber(chapterNumber),
+      chapterCount(chapterCount),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent) {}
@@ -57,7 +62,7 @@ void EpubReaderMenuActivity::loop() {
     requestUpdate();
   });
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
     const auto selectedAction = menuItems[selectedIndex].action;
     if (selectedAction == MenuAction::ROTATE_SCREEN) {
       // Cycle orientation preview locally; actual rotation happens on menu exit.
@@ -75,7 +80,7 @@ void EpubReaderMenuActivity::loop() {
     setResult(MenuResult{static_cast<int>(selectedAction), pendingOrientation, selectedPageTurnOption});
     finish();
     return;
-  } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+  } else if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
     result.data = MenuResult{-1, pendingOrientation, selectedPageTurnOption};
@@ -111,18 +116,37 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
       contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, truncTitle.c_str(), EpdFontFamily::BOLD)) / 2;
   renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, truncTitle.c_str(), true, EpdFontFamily::BOLD);
 
-  // Progress summary
+  // Chapter and progress summary
+  std::string chapterLine;
+  if (chapterNumber > 0) {
+    chapterLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(chapterNumber);
+    if (chapterCount > 0) {
+      chapterLine += "/" + std::to_string(chapterCount);
+    }
+    if (!chapterTitle.empty()) {
+      chapterLine += ": " + chapterTitle;
+    }
+  } else if (!chapterTitle.empty()) {
+    chapterLine = chapterTitle;
+  }
+
+  if (!chapterLine.empty()) {
+    const std::string truncatedChapter =
+        renderer.truncatedText(UI_10_FONT_ID, chapterLine.c_str(), contentWidth - 40);
+    renderer.drawCenteredText(UI_10_FONT_ID, 43 + contentY, truncatedChapter.c_str());
+  }
+
   std::string progressLine;
   if (totalPages > 0) {
     progressLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(currentPage) + "/" +
                    std::to_string(totalPages) + std::string(tr(STR_PAGES_SEPARATOR));
   }
   progressLine += std::string(tr(STR_BOOK_PREFIX)) + std::to_string(bookProgressPercent) + "%";
-  renderer.drawCenteredText(UI_10_FONT_ID, 45, progressLine.c_str());
+  renderer.drawCenteredText(UI_10_FONT_ID, 62 + contentY, progressLine.c_str());
 
   // Menu Items
-  const int startY = 75 + contentY;
-  constexpr int lineHeight = 30;
+  const int startY = 90 + contentY;
+  constexpr int lineHeight = 28;
 
   for (size_t i = 0; i < menuItems.size(); ++i) {
     const int displayY = startY + (i * lineHeight);

@@ -66,7 +66,10 @@ The Bluetooth setup screen supports scanning, HID-device filtering, connecting, 
 monitor for inspecting incoming HID reports. Bonded remote details are saved in settings and reused for reconnects.
 
 Bluetooth uses additional RAM on the ESP32-C3. When memory is tight, the reader now prefers safe fallbacks, such as
-skipping the anti-aliased text pass instead of failing the page render.
+using a slower anti-aliased cleanup path instead of failing the page render. Bluetooth is disabled before deep sleep,
+scans are stopped when leaving the Bluetooth screen, and the BLE transmit power is kept at the ESP32-C3 default instead
+of maximum power to reduce battery drain. If the radio is enabled but no remote is connected or scanning, it suspends
+after one idle minute and wakes again from reader-local input to look for the bonded remote.
 
 ### Improvements in this branch
 
@@ -78,15 +81,17 @@ skipping the anti-aliased text pass instead of failing the page render.
 - Bluetooth-aware reader page turns that avoid accidental chapter skips from delayed remote release events.
 - Bluetooth activity tracking to reduce unwanted autosleep while a remote is in use.
 - Bluetooth shutdown before deep sleep to keep the power path predictable.
+- Lower BLE transmit power, stop active scans when leaving Bluetooth settings, and auto-suspend disconnected idle Bluetooth to reduce battery drain.
+- Reader status bar Bluetooth indicator next to the battery: icon shown when Bluetooth is on, filled dot when connected.
 - Reader menu shortcut for opening Bluetooth settings directly from an EPUB.
 - Serial Bluetooth debug commands for scan, connect, and HID report troubleshooting.
 - EPUB first-open behavior now preserves spine order instead of jumping directly to the OPF text reference.
 - EPUB section builds clear font cache before retrying memory-heavy cache work.
 - EPUB image extraction retries with smaller chunks and dimension probing retries for more reliable image handling.
 - Low-heap CSS fallback to avoid spending memory on embedded styles when heap is already constrained.
-- Anti-aliased text rendering safely skips the grayscale pass if the BW scratch buffer cannot be allocated.
+- Anti-aliased text rendering safely falls back to a slower cleanup path if the BW scratch buffer cannot be allocated.
 - Status bar counter partial refresh for faster Bluetooth-driven page turns.
-- TXT reader buffer handling moved from manual allocation to `std::vector`.
+- TXT reader chunk buffer handling uses checked `std::unique_ptr<uint8_t[]>` ownership.
 - XTC 1-bit page rendering streams from storage instead of allocating a full page buffer.
 - XTCH 2-bit grayscale rendering streams plane data in passes to reduce peak heap usage.
 - XTC cover and thumbnail generation use lower-memory paths and low-heap thumbnail caps.

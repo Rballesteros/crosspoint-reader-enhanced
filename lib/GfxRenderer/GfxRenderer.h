@@ -30,6 +30,9 @@ class GfxRenderer {
 
  private:
   static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
+  static constexpr size_t BW_BUFFER_MAX_CHUNKS =
+      (EInkDisplay::MAX_BUFFER_SIZE + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
+  static constexpr size_t BW_BUFFER_HEAP_SAFETY_MARGIN = 24 * 1024;
 
   HalDisplay& display;
   RenderMode renderMode;
@@ -40,7 +43,9 @@ class GfxRenderer {
   uint16_t panelHeight = HalDisplay::DISPLAY_HEIGHT;
   uint16_t panelWidthBytes = HalDisplay::DISPLAY_WIDTH_BYTES;
   uint32_t frameBufferSize = HalDisplay::BUFFER_SIZE;
-  std::vector<std::vector<uint8_t>> bwBufferChunks;
+  uint8_t* bwBufferChunks[BW_BUFFER_MAX_CHUNKS] = {};
+  size_t bwBufferChunkSizes[BW_BUFFER_MAX_CHUNKS] = {};
+  size_t bwBufferChunkCount = 0;
   std::map<int, EpdFontFamily> fontMap;
 
   // Mutable because drawText() is const but needs to delegate scan-mode

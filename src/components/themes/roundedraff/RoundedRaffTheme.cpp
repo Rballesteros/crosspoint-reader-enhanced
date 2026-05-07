@@ -111,18 +111,29 @@ void RoundedRaffTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const 
   const bool showBatteryPercentage =
       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
   const uint16_t percentage = powerManager.getBatteryPercentage();
+  const bool showBluetooth = BaseTheme::showBluetoothStatusIndicator();
   const int batteryIconX = rect.x + rect.width - sidePadding - RoundedRaffMetrics::values.batteryWidth;
   int batteryGroupLeftX = batteryIconX;
+  const int maxBatteryTextWidth = renderer.getTextWidth(SMALL_FONT_ID, "100%");
   if (showBatteryPercentage) {
     const auto percentageText = std::to_string(percentage) + "%";
     batteryGroupLeftX -= renderer.getTextWidth(SMALL_FONT_ID, percentageText.c_str()) + batteryPercentSpacing;
+  }
 
-    // Clear a fixed-width area for the battery percentage to avoid ghosting when digit count changes (e.g. 100% ->
-    // 99%).
-    const int maxTextWidth = renderer.getTextWidth(SMALL_FONT_ID, "100%");
-    const int clearW = maxTextWidth + batteryPercentSpacing + RoundedRaffMetrics::values.batteryWidth;
+  int bluetoothIconX = 0;
+  if (showBluetooth) {
+    bluetoothIconX = batteryGroupLeftX - BaseTheme::bluetoothStatusSpacing - BaseTheme::bluetoothStatusWidth;
+    batteryGroupLeftX = bluetoothIconX;
+  }
+
+  if (showBatteryPercentage || showBluetooth) {
+    // Clear a fixed-width area to avoid ghosting when digit count or Bluetooth state changes.
+    const int clearLeftX = batteryIconX -
+                           (showBatteryPercentage ? maxBatteryTextWidth + batteryPercentSpacing : 0) -
+                           (showBluetooth ? BaseTheme::bluetoothStatusSpacing + BaseTheme::bluetoothStatusWidth : 0);
+    const int clearW = rect.x + rect.width - clearLeftX;
     const int clearH = std::max(renderer.getTextHeight(SMALL_FONT_ID), RoundedRaffMetrics::values.batteryHeight + 8);
-    renderer.fillRect(batteryIconX - maxTextWidth - batteryPercentSpacing, rect.y + 14, clearW, clearH, false);
+    renderer.fillRect(clearLeftX, rect.y + 14, clearW, clearH, false);
   }
 
   const int maxTextWidth = std::max(0, batteryGroupLeftX - 20 - titleX);
@@ -132,6 +143,11 @@ void RoundedRaffTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const 
                          Rect{batteryIconX, rect.y + 14, RoundedRaffMetrics::values.batteryWidth,
                               RoundedRaffMetrics::values.batteryHeight},
                          percentage, showBatteryPercentage);
+  if (showBluetooth) {
+    const int iconY =
+        rect.y + 14 + 6 + (RoundedRaffMetrics::values.batteryHeight - BaseTheme::bluetoothStatusHeight) / 2;
+    BaseTheme::drawBluetoothStatusIcon(renderer, bluetoothIconX, iconY, BaseTheme::isBluetoothStatusConnected());
+  }
 }
 
 void RoundedRaffTheme::drawTabBar(const GfxRenderer& renderer, Rect rect, const std::vector<TabInfo>& tabs,

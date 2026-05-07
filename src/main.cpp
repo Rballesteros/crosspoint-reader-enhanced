@@ -323,17 +323,17 @@ void loop() {
 
   gBluetoothReaderContext = activityManager.isReaderActivity();
   auto& btMgr = BluetoothHIDManager::getInstance();
-  // Reader-only: if BT has been disconnected for several seconds in reader, release the
-  // radio to free NimBLE's ~50-80KB so EPUB rendering doesn't OOM. The wake-on-input
-  // path below will bring it back. Avoids the original 60s idle window that let the
-  // heap stay pinned long enough to crash mid-chapter.
+  // Global auto-release: if BT has been enabled but disconnected/idle for several seconds,
+  // release the radio to free NimBLE's ~50-80KB heap. This prevents the radio stack
+  // from pinning the heap low during navigation or heavy UI work.
+  // Wake-on-input or manual settings toggle will bring it back.
   static unsigned long btDisconnectedSinceMs = 0;
-  if (btMgr.isEnabled() && gBluetoothReaderContext && !btMgr.hasConnectedDevice()) {
+  if (btMgr.isEnabled() && !btMgr.hasConnectedDevice() && !btMgr.isScanning()) {
     const unsigned long now = millis();
     if (btDisconnectedSinceMs == 0) {
       btDisconnectedSinceMs = now;
-    } else if (now - btDisconnectedSinceMs > 8000) {
-      LOG_INF("BT", "BT disconnected >8s in reader; releasing radio to free heap");
+    } else if (now - btDisconnectedSinceMs > 10000) {
+      LOG_INF("BT", "BT idle >10s; releasing radio to free heap");
       btMgr.disable();
       btDisconnectedSinceMs = 0;
     }
@@ -365,9 +365,28 @@ void loop() {
   renderer.setFadingFix(SETTINGS.fadingFix);
 
   if (Serial && millis() - lastMemPrint >= 10000) {
-    LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
-            ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+    const auto uiStack = uxTaskGetStackHighWaterMark(nullptr);
+    const auto renderStack = uxTaskGetStackHighWaterMark(activityManager.getRenderTaskHandle());
+    const size_t maxAlloc = ESP.getMaxAllocHeap();
+
+    multi_heap_info_t info;
+    heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+
+    LOG_INF("MEM", "Free: %d, MaxAlloc: %d, Blocks: %d | Stack: UI:%u, Render:%u",
+            static_cast<int>(info.total_free_bytes),
+            static_cast<int>(info.largest_free_block),
+            static_cast<int>(info.free_blocks),
+            static_cast<unsigned>(uiStack), static_cast<unsigned>(renderStack));
+
     lastMemPrint = millis();
+    recordHeapSample();
+
+    // Emergency fragmentation mitigation: if the largest free block is dangerously small,
+    // flush the font cache to consolidate memory holes.
+    if (maxAlloc < 8192) {
+      LOG_INF("MEM", "Fragmentation emergency: flushing font cache");
+      fontCacheManager.clearCache();
+    }
   }
 
   // Handle incoming serial commands,

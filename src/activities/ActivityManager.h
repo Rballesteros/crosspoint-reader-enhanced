@@ -40,6 +40,8 @@ class ActivityManager {
   std::vector<std::unique_ptr<Activity>> stackActivities;
   std::unique_ptr<Activity> currentActivity;
 
+  size_t lastHeapValue = 0;
+
   void exitActivity(const RenderLock& lock);
 
   // Pending activity to be launched on next loop iteration
@@ -111,6 +113,8 @@ class ActivityManager {
   // Trigger a render and block until it completes.
   // Must NOT be called from the render task or while holding a RenderLock.
   void requestUpdateAndWait();
+
+  TaskHandle_t getRenderTaskHandle() const { return renderTaskHandle; }
 };
 
 extern ActivityManager activityManager;  // singleton, to be defined in main.cpp

@@ -2,12 +2,32 @@
 
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
+#include <HeapBudget.h>
 #include <Logging.h>
 #include <Utf8.h>
+#include <esp_heap_caps.h>
 
 #include <algorithm>
+#include <memory>
+#include <new>
 
 #include "FontCacheManager.h"
+
+namespace {
+constexpr size_t BITMAP_ROW_HEAP_SAFETY_MARGIN = 8 * 1024;
+
+// Allocate a row buffer with a heap-budget pre-check. Returns nullptr (no log
+// noise beyond canAllocate's own LOG_DBG) when there isn't headroom.
+std::unique_ptr<uint8_t[]> allocRowBuffer(size_t size, const char* label) {
+  if (size == 0) return nullptr;
+  if (!HeapBudget::canAllocate(size, size, BITMAP_ROW_HEAP_SAFETY_MARGIN, "GFX", label)) return nullptr;
+  std::unique_ptr<uint8_t[]> p(new (std::nothrow) uint8_t[size]);
+  if (!p) {
+    LOG_DBG("GFX", "Failed to allocate %s (%u bytes)", label, static_cast<unsigned>(size));
+  }
+  return p;
+}
+}  // namespace
 
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
   if (fontData->groups != nullptr) {
@@ -35,8 +55,6 @@ void GfxRenderer::begin() {
   panelHeight = display.getDisplayHeight();
   panelWidthBytes = display.getDisplayWidthBytes();
   frameBufferSize = display.getBufferSize();
-  const size_t numChunks = (frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
-  bwBufferChunks.reserve(numChunks);
 }
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
@@ -368,7 +386,7 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, std::stri
   }
 
   if (fontCacheManager_ && fontCacheManager_->isScanning()) {
-    fontCacheManager_->recordText(std::string(text).c_str(), fontId, style);
+    fontCacheManager_->recordText(text, fontId, style);
     return;
   }
 
@@ -857,8 +875,11 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
   // Calculate output row size (2 bits per pixel, packed into bytes)
   // IMPORTANT: Use int, not uint8_t, to avoid overflow for images > 1020 pixels wide
   const int outputRowSize = (bitmap.getWidth() + 3) / 4;
-  std::vector<uint8_t> outputRow(outputRowSize);
-  std::vector<uint8_t> rowBytes(bitmap.getRowBytes());
+  auto outputRow = allocRowBuffer(static_cast<size_t>(outputRowSize), "bitmap output row");
+  auto rowBytes = allocRowBuffer(static_cast<size_t>(bitmap.getRowBytes()), "bitmap source row");
+  if (!outputRow || !rowBytes) {
+    return;
+  }
 
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
     // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
@@ -872,7 +893,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       break;
     }
 
-    if (bitmap.readNextRow(outputRow.data(), rowBytes.data()) != BmpReaderError::Ok) {
+    if (bitmap.readNextRow(outputRow.get(), rowBytes.get()) != BmpReaderError::Ok) {
       LOG_ERR("GFX", "Failed to read row %d from bitmap", bmpY);
       return;
     }
@@ -927,12 +948,15 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
 
   // For 1-bit BMP, output is still 2-bit packed (for consistency with readNextRow)
   const int outputRowSize = (bitmap.getWidth() + 3) / 4;
-  std::vector<uint8_t> outputRow(outputRowSize);
-  std::vector<uint8_t> rowBytes(bitmap.getRowBytes());
+  auto outputRow = allocRowBuffer(static_cast<size_t>(outputRowSize), "1-bit bitmap output row");
+  auto rowBytes = allocRowBuffer(static_cast<size_t>(bitmap.getRowBytes()), "1-bit bitmap source row");
+  if (!outputRow || !rowBytes) {
+    return;
+  }
 
   for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
     // Read rows sequentially using readNextRow
-    if (bitmap.readNextRow(outputRow.data(), rowBytes.data()) != BmpReaderError::Ok) {
+    if (bitmap.readNextRow(outputRow.get(), rowBytes.get()) != BmpReaderError::Ok) {
       LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
       return;
     }
@@ -1076,13 +1100,19 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, std::string_
 
   std::string_view remaining = text;
   std::string currentLine;
+  currentLine.reserve(64);
 
   while (!remaining.empty()) {
     if (static_cast<int>(lines.size()) == maxLines - 1) {
       // Last available line: combine any word already started on this line with
       // the rest of the text, then let truncatedText fit it with an ellipsis.
-      std::string lastContent = currentLine.empty() ? std::string(remaining) : currentLine + " " + std::string(remaining);
-      lines.push_back(truncatedText(fontId, lastContent, maxWidth, style));
+      if (!currentLine.empty()) {
+        currentLine.push_back(' ');
+        currentLine.append(remaining.data(), remaining.size());
+        lines.push_back(truncatedText(fontId, currentLine, maxWidth, style));
+      } else {
+        lines.push_back(truncatedText(fontId, remaining, maxWidth, style));
+      }
       return lines;
     }
 
@@ -1098,30 +1128,36 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, std::string_
       remaining.remove_prefix(spacePos + 1);
     }
 
-    std::string testLine = currentLine.empty() ? std::string(word) : currentLine + " " + std::string(word);
+    // Try appending the word to currentLine in place. If it doesn't fit, resize back.
+    const size_t prevLen = currentLine.size();
+    if (prevLen > 0) currentLine.push_back(' ');
+    currentLine.append(word.data(), word.size());
 
-    if (getTextWidth(fontId, testLine, style) <= maxWidth) {
-      currentLine = testLine;
-    } else {
-      if (!currentLine.empty()) {
-        lines.push_back(currentLine);
-        // If the carried-over word itself exceeds maxWidth, truncate it and
-        // push it as a complete line immediately — storing it in currentLine
-        // would allow a subsequent short word to be appended after the ellipsis.
-        if (getTextWidth(fontId, word, style) > maxWidth) {
-          lines.push_back(truncatedText(fontId, word, maxWidth, style));
-          currentLine.clear();
-          if (static_cast<int>(lines.size()) >= maxLines) return lines;
-        } else {
-          currentLine = std::string(word);
-        }
-      } else {
-        // Single word wider than maxWidth: truncate and stop to avoid complicated
-        // splitting rules (different between languages). Results in an aesthetically
-        // pleasing end.
+    if (getTextWidth(fontId, currentLine, style) <= maxWidth) {
+      // Fits — keep it.
+      continue;
+    }
+    // Doesn't fit — revert.
+    currentLine.resize(prevLen);
+
+    if (!currentLine.empty()) {
+      lines.push_back(currentLine);
+      currentLine.clear();
+      // If the carried-over word itself exceeds maxWidth, truncate it and
+      // push it as a complete line immediately — storing it in currentLine
+      // would allow a subsequent short word to be appended after the ellipsis.
+      if (getTextWidth(fontId, word, style) > maxWidth) {
         lines.push_back(truncatedText(fontId, word, maxWidth, style));
-        return lines;
+        if (static_cast<int>(lines.size()) >= maxLines) return lines;
+      } else {
+        currentLine.append(word.data(), word.size());
       }
+    } else {
+      // Single word wider than maxWidth: truncate and stop to avoid complicated
+      // splitting rules (different between languages). Results in an aesthetically
+      // pleasing end.
+      lines.push_back(truncatedText(fontId, word, maxWidth, style));
+      return lines;
     }
   }
 
@@ -1325,8 +1361,14 @@ void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuff
 
 void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
 void GfxRenderer::freeBwBufferChunks() {
-  bwBufferChunks.clear();
-  bwBufferChunks.shrink_to_fit();
+  for (size_t i = 0; i < bwBufferChunkCount; i++) {
+    if (bwBufferChunks[i]) {
+      heap_caps_free(bwBufferChunks[i]);
+      bwBufferChunks[i] = nullptr;
+    }
+    bwBufferChunkSizes[i] = 0;
+  }
+  bwBufferChunkCount = 0;
 }
 
 /**
@@ -1341,21 +1383,36 @@ bool GfxRenderer::storeBwBuffer() {
   freeBwBufferChunks();
 
   const size_t numChunks = (frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
-  bwBufferChunks.reserve(numChunks);
+  if (numChunks > BW_BUFFER_MAX_CHUNKS) {
+    LOG_ERR("GFX", "!! BW buffer needs %zu chunks, max is %zu", numChunks, BW_BUFFER_MAX_CHUNKS);
+    return false;
+  }
+
+  if (!HeapBudget::canAllocate(frameBufferSize, BW_BUFFER_CHUNK_SIZE, BW_BUFFER_HEAP_SAFETY_MARGIN, "GFX",
+                               "BW buffer store")) {
+    return false;
+  }
 
   for (size_t i = 0; i < numChunks; i++) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
     const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
 
-    bwBufferChunks.emplace_back(frameBuffer + offset, frameBuffer + offset + chunkSize);
-    if (bwBufferChunks.back().size() != chunkSize) {
-      LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
+    auto* chunk = static_cast<uint8_t*>(heap_caps_malloc(chunkSize, MALLOC_CAP_8BIT));
+    if (!chunk) {
+      LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes), free=%u maxAlloc=%u", i, chunkSize,
+              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
       freeBwBufferChunks();
       return false;
     }
+
+    memcpy(chunk, frameBuffer + offset, chunkSize);
+    bwBufferChunks[i] = chunk;
+    bwBufferChunkSizes[i] = chunkSize;
+    bwBufferChunkCount = i + 1;
   }
 
-  LOG_DBG("GFX", "Stored BW buffer in %zu chunks (%zu bytes each)", bwBufferChunks.size(), BW_BUFFER_CHUNK_SIZE);
+  LOG_DBG("GFX", "Stored BW buffer in %zu chunks (%zu bytes each)", bwBufferChunkCount, BW_BUFFER_CHUNK_SIZE);
   return true;
 }
 
@@ -1365,14 +1422,14 @@ bool GfxRenderer::storeBwBuffer() {
  * Uses chunked restoration to match chunked storage.
  */
 void GfxRenderer::restoreBwBuffer() {
-  if (bwBufferChunks.empty()) {
+  if (bwBufferChunkCount == 0) {
     return;
   }
 
-  for (size_t i = 0; i < bwBufferChunks.size(); i++) {
+  for (size_t i = 0; i < bwBufferChunkCount; i++) {
     const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
-    const size_t chunkSize = bwBufferChunks[i].size();
-    memcpy(frameBuffer + offset, bwBufferChunks[i].data(), chunkSize);
+    const size_t chunkSize = bwBufferChunkSizes[i];
+    memcpy(frameBuffer + offset, bwBufferChunks[i], chunkSize);
   }
 
   display.cleanupGrayscaleBuffers(frameBuffer);

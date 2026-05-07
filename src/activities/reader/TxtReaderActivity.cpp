@@ -7,6 +7,9 @@
 #include <Serialization.h>
 #include <Utf8.h>
 
+#include <memory>
+#include <new>
+
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
@@ -58,6 +61,11 @@ void TxtReaderActivity::onExit() {
 }
 
 void TxtReaderActivity::loop() {
+  if (ReaderUtils::preferPressForBleInput() && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    activityManager.goHome();
+    return;
+  }
+
   // Long press BACK (1s+) goes to file selection
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(txt ? txt->getPath() : "");
@@ -65,7 +73,8 @@ void TxtReaderActivity::loop() {
   }
 
   // Short press BACK goes directly to home
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+  if (!ReaderUtils::preferPressForBleInput() &&
+      mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     activityManager.goHome();
     return;
@@ -180,9 +189,12 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
 
   // Read a chunk from file
   size_t chunkSize = std::min(CHUNK_SIZE, fileSize - offset);
-  std::vector<uint8_t> buffer(chunkSize + 1);
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[chunkSize + 1]);
+  if (!buffer) {
+    return false;
+  }
 
-  if (!txt->readContent(buffer.data(), offset, chunkSize)) {
+  if (!txt->readContent(buffer.get(), offset, chunkSize)) {
     return false;
   }
   buffer[chunkSize] = '\0';

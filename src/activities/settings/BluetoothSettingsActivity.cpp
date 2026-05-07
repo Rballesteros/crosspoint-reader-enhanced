@@ -8,6 +8,7 @@
 
 #include "CrossPointSettings.h"
 #include "DeviceProfiles.h"
+#include "HalGPIO.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -73,6 +74,39 @@ std::string localizedBluetoothError(const std::string& error) {
   return error;
 }
 
+const char* mappedButtonDebugLabel(uint8_t buttonIndex) {
+  if (buttonIndex == SETTINGS.frontButtonConfirm) {
+    return "Confirm";
+  }
+  if (buttonIndex == SETTINGS.frontButtonBack) {
+    return "Back";
+  }
+  if (buttonIndex == SETTINGS.frontButtonLeft) {
+    return "Left";
+  }
+  if (buttonIndex == SETTINGS.frontButtonRight) {
+    return "Right";
+  }
+  switch (buttonIndex) {
+    case HalGPIO::BTN_UP:
+      return "Up/PageBack";
+    case HalGPIO::BTN_DOWN:
+      return "Down/PageForward";
+    case HalGPIO::BTN_LEFT:
+      return "Left";
+    case HalGPIO::BTN_RIGHT:
+      return "Right";
+    case HalGPIO::BTN_CONFIRM:
+      return "Confirm";
+    case HalGPIO::BTN_BACK:
+      return "Back";
+    case HalGPIO::BTN_POWER:
+      return "Power";
+    default:
+      return "Unmapped";
+  }
+}
+
 }  // namespace
 
 void BluetoothSettingsActivity::onEnter() {
@@ -95,9 +129,15 @@ void BluetoothSettingsActivity::onEnter() {
   learnTestForwardCount = 0;
   learnTestBackCount = 0;
   debugLastKeycode = 0;
+  debugLastReportIndex = 0xFF;
+  debugLastMappedButton = 0xFF;
+  debugLastPressed = false;
+  debugLastRawLength = 0;
   debugEventCount = 0;
+  debugRenderedEventCount = 0;
   debugLastEventMs = 0;
   debugUniqueCount = 0;
+  memset(debugLastRaw, 0, sizeof(debugLastRaw));
   memset(debugUniqueKeys, 0, sizeof(debugUniqueKeys));
   memset(debugUniqueCounts, 0, sizeof(debugUniqueCounts));
   learnStep = LearnStep::WAIT_PREV;
@@ -126,8 +166,12 @@ void BluetoothSettingsActivity::onEnter() {
 
 void BluetoothSettingsActivity::onExit() {
   if (btMgr) {
-    btMgr->setLearnInputCallback(nullptr);
-    btMgr->setInputCallback(nullptr);
+    if (btMgr->isScanning()) {
+      btMgr->stopScan();
+    }
+    btMgr->setLearnInputCallback(nullptr, nullptr);
+    btMgr->setInputCallback(nullptr, nullptr);
+    btMgr->setDebugInputCallback(nullptr, nullptr);
   }
   Activity::onExit();
 }
@@ -145,7 +189,7 @@ void BluetoothSettingsActivity::loop() {
       return;
     } else if (viewMode == ViewMode::LEARN_KEYS) {
       if (btMgr) {
-        btMgr->setLearnInputCallback(nullptr);
+        btMgr->setLearnInputCallback(nullptr, nullptr);
       }
       viewMode = ViewMode::MAIN_MENU;
       selectedIndex = 0;
@@ -156,7 +200,8 @@ void BluetoothSettingsActivity::loop() {
       return;
     } else if (viewMode == ViewMode::DEBUG_MONITOR) {
       if (btMgr) {
-        btMgr->setInputCallback(nullptr);
+        btMgr->setInputCallback(nullptr, nullptr);
+        btMgr->setDebugInputCallback(nullptr, nullptr);
       }
       viewMode = ViewMode::MAIN_MENU;
       selectedIndex = 0;
@@ -218,13 +263,15 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
   constexpr int kForgetBondedRemoteIndex = 6;
 #endif
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
-    selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : (kMainMenuItemCount - 1);
+  buttonNavigator.onPrevious([this, kMainMenuItemCount] {
+    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, kMainMenuItemCount);
     requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
-    selectedIndex = (selectedIndex < (kMainMenuItemCount - 1)) ? selectedIndex + 1 : 0;
+  });
+
+  buttonNavigator.onNext([this, kMainMenuItemCount] {
+    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, kMainMenuItemCount);
     requestUpdate();
-  }
+  });
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     if (!btMgr) {
@@ -325,12 +372,7 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
         learnTestBackSeen = false;
         learnTestForwardCount = 0;
         learnTestBackCount = 0;
-        btMgr->setLearnInputCallback([this](uint8_t keycode, uint8_t reportIndex) {
-          if (viewMode == ViewMode::LEARN_KEYS && keycode > 0 && reportIndex != 0xFF) {
-            pendingLearnKey = keycode;
-            pendingLearnIndex = reportIndex;
-          }
-        });
+        btMgr->setLearnInputCallback(&BluetoothSettingsActivity::onLearnInputTrampoline, this);
         lastError = "Wizard: press FORWARD button";
       }
       requestUpdate();
@@ -341,34 +383,19 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
         btMgr->setDebugCaptureEnabled(true);
       }
       debugLastKeycode = 0;
+      debugLastReportIndex = 0xFF;
+      debugLastMappedButton = 0xFF;
+      debugLastPressed = false;
+      debugLastRawLength = 0;
       debugEventCount = 0;
+      debugRenderedEventCount = 0;
       debugLastEventMs = 0;
       debugUniqueCount = 0;
+      memset(debugLastRaw, 0, sizeof(debugLastRaw));
       memset(debugUniqueKeys, 0, sizeof(debugUniqueKeys));
       memset(debugUniqueCounts, 0, sizeof(debugUniqueCounts));
-      btMgr->setInputCallback([this](uint16_t keycode) {
-        debugLastKeycode = keycode & 0xFF;
-        debugEventCount++;
-        debugLastEventMs = millis();
-
-        const uint8_t code = static_cast<uint8_t>(keycode & 0xFF);
-        bool found = false;
-        for (uint8_t i = 0; i < debugUniqueCount; i++) {
-          if (debugUniqueKeys[i] == code) {
-            if (debugUniqueCounts[i] < 65535) {
-              debugUniqueCounts[i]++;
-            }
-            found = true;
-            break;
-          }
-        }
-
-        if (!found && debugUniqueCount < kDebugUniqueKeyMax) {
-          debugUniqueKeys[debugUniqueCount] = code;
-          debugUniqueCounts[debugUniqueCount] = 1;
-          debugUniqueCount++;
-        }
-      });
+      btMgr->setInputCallback(nullptr, nullptr);
+      btMgr->setDebugInputCallback(&BluetoothSettingsActivity::onDebugDecodedInputTrampoline, this);
       viewMode = ViewMode::DEBUG_MONITOR;
       lastError = "BT debug monitor";
       requestUpdate();
@@ -499,7 +526,7 @@ void BluetoothSettingsActivity::handleLearnInput() {
 
   if (learnStep == LearnStep::WAIT_TEST && millis() > learnTestDeadlineMs) {
     if (btMgr) {
-      btMgr->setLearnInputCallback(nullptr);
+      btMgr->setLearnInputCallback(nullptr, nullptr);
     }
     viewMode = ViewMode::MAIN_MENU;
     selectedIndex = 0;
@@ -517,7 +544,8 @@ void BluetoothSettingsActivity::handleLearnInput() {
         DeviceProfiles::setCustomProfileForDevice(dev.address, learnedPrevKey, learnedNextKey, learnedReportIndex,
                                                   learnedConfirmKey, learnedCancelKey);
       }
-      btMgr->setLearnInputCallback(nullptr);
+      btMgr->refreshLearnedActionOverrides();
+      btMgr->setLearnInputCallback(nullptr, nullptr);
     }
     learnStep = LearnStep::DONE;
     char buf[96];
@@ -539,7 +567,7 @@ void BluetoothSettingsActivity::handleLearnInput() {
 
   if (learnStep == LearnStep::DONE && mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     if (btMgr) {
-      btMgr->setLearnInputCallback(nullptr);
+      btMgr->setLearnInputCallback(nullptr, nullptr);
     }
     viewMode = ViewMode::MAIN_MENU;
     selectedIndex = 0;
@@ -588,58 +616,25 @@ void BluetoothSettingsActivity::handleDeviceListInput() {
   if (selectedIndex > maxIndex) selectedIndex = maxIndex;
   if (selectedIndex < 0) selectedIndex = 0;
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
-    selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : maxIndex;
+  auto syncHighlightedDevice = [this, &visible] {
     if (selectedIndex < static_cast<int>(visible.size())) {
       highlightedAddress = visible[selectedIndex]->address;
     } else {
       highlightedAddress.clear();
     }
-    requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
-    selectedIndex = (selectedIndex < maxIndex) ? selectedIndex + 1 : 0;
-    if (selectedIndex < static_cast<int>(visible.size())) {
-      highlightedAddress = visible[selectedIndex]->address;
-    } else {
-      highlightedAddress.clear();
-    }
-    requestUpdate();
-  }
+  };
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    // Go back to main menu (also stops an in-progress scan)
-    viewMode = ViewMode::MAIN_MENU;
-    selectedIndex = 0;
-    if (btMgr && btMgr->isScanning()) {
-      btMgr->stopScan();
-    }
+  buttonNavigator.onPrevious([this, maxIndex, &syncHighlightedDevice] {
+    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, maxIndex + 1);
+    syncHighlightedDevice();
     requestUpdate();
-    return;
-  }
+  });
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    // Context-aware: identify if a nameless device is highlighted; rescan otherwise.
-    if (selectedIndex >= 0 && selectedIndex < static_cast<int>(visible.size()) &&
-        labelLooksUnknown(visible[selectedIndex]->name)) {
-      const auto& device = *visible[selectedIndex];
-      LOG_INF("BT", "Identify request for %s", device.address.c_str());
-      lastError = "Identifying...";
-      requestUpdate();
-      const bool ok = btMgr->identifyDevice(device.address);
-      lastError = ok ? "Identified" :
-                       (btMgr->lastError.empty() ? "Identify failed" : btMgr->lastError);
-      requestUpdate();
-      return;
-    }
-
-    LOG_INF("BT", "Quick rescan...");
-    lastError = "Scanning...";
-    showOnlyHID = false;
-    btMgr->startScan(kSettingsScanDurationMs);
-    lastScanTime = millis();
+  buttonNavigator.onNext([this, maxIndex, &syncHighlightedDevice] {
+    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, maxIndex + 1);
+    syncHighlightedDevice();
     requestUpdate();
-    return;
-  }
+  });
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     if (selectedIndex == filterIdx) {
@@ -731,6 +726,11 @@ void BluetoothSettingsActivity::render(RenderLock&&) {
 void BluetoothSettingsActivity::handleDebugInput() {
   if (!btMgr) {
     return;
+  }
+
+  if (debugRenderedEventCount != debugEventCount) {
+    debugRenderedEventCount = debugEventCount;
+    requestUpdate();
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
@@ -830,8 +830,7 @@ void BluetoothSettingsActivity::renderMainMenu() {
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, statusY, statusText.c_str(), true);
   }
 
-  // Button hints
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
@@ -955,24 +954,13 @@ void BluetoothSettingsActivity::renderDeviceList() {
       [&deviceValues](int i) { return i < (int)deviceValues.size() ? deviceValues[i] : std::string(""); },
       true);
 
-  // Help text — Right doubles as Identify when a nameless device is highlighted;
-  // Left doubles as Stop while scan is in progress.
-  const bool selectionIsUnknown =
-      selectedIndex >= 0 && selectedIndex < static_cast<int>(visible.size()) &&
-      labelLooksUnknown(visible[selectedIndex]->name);
-  const char* helpText;
-  if (btMgr->isScanning()) {
-    helpText = "Up/Down: Scroll | Left: Stop";
-  } else if (selectionIsUnknown) {
-    helpText = "Up/Down: Scroll | Right: Identify";
-  } else {
-    helpText = "Up/Down: Scroll | Right: Rescan";
-  }
+  // Help text keeps navigation consistent with the rest of settings. Rescan,
+  // filter, and disconnect are selectable action rows in the list.
   GUI.drawHelpText(renderer,
                    Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
-                   helpText);
+                   "Up/Down: Scroll | Select: Connect");
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONNECT), tr(STR_DIR_LEFT), tr(STR_RETRY));
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONNECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
@@ -1088,12 +1076,30 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
   char line2[64];
   char line3[64];
   char line4[64];
+  char line5[64];
+  char line6[64];
+  char line7[64];
 
   unsigned int connectedCount = btMgr ? static_cast<unsigned int>(btMgr->getConnectedDevicesCopy().size()) : 0;
   snprintf(line1, sizeof(line1), "Connected: %u", connectedCount);
-  snprintf(line2, sizeof(line2), "Key events: %u", static_cast<unsigned>(debugEventCount));
+  snprintf(line2, sizeof(line2), "Decoded reports: %u", static_cast<unsigned>(debugEventCount));
   snprintf(line3, sizeof(line3), "Unique keys: %u", static_cast<unsigned>(debugUniqueCount));
   snprintf(line4, sizeof(line4), "Last key: 0x%02X", static_cast<unsigned>(debugLastKeycode & 0xFF));
+  if (debugLastReportIndex == 0xFF) {
+    snprintf(line5, sizeof(line5), "Byte: --  State: %s", debugLastPressed ? "down" : "up");
+  } else {
+    snprintf(line5, sizeof(line5), "Byte: %u  State: %s", static_cast<unsigned>(debugLastReportIndex),
+             debugLastPressed ? "down" : "up");
+  }
+  snprintf(line6, sizeof(line6), "Mapped: %s", mappedButtonDebugLabel(debugLastMappedButton));
+  if (debugLastRawLength == 0) {
+    snprintf(line7, sizeof(line7), "Raw: --");
+  } else {
+    int pos = snprintf(line7, sizeof(line7), "Raw:");
+    for (uint8_t i = 0; i < debugLastRawLength && pos > 0 && pos < static_cast<int>(sizeof(line7)) - 4; i++) {
+      pos += snprintf(line7 + pos, sizeof(line7) - pos, " %02X", static_cast<unsigned>(debugLastRaw[i]));
+    }
+  }
 
   renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 24,
                             line1);
@@ -1103,16 +1109,22 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
                             line3);
   renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 96,
                             line4);
+  renderer.drawCenteredText(UI_10_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 116,
+                            line5);
+  renderer.drawCenteredText(UI_10_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 134,
+                            line6);
+  renderer.drawCenteredText(UI_10_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 152,
+                            line7);
 
   if (debugLastEventMs > 0) {
     char eventAgeLine[64];
     snprintf(eventAgeLine, sizeof(eventAgeLine), "Last event: %lus ago", (millis() - debugLastEventMs) / 1000);
     renderer.drawCenteredText(UI_10_FONT_ID,
-                              metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 114,
+                              metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 170,
                               eventAgeLine);
   }
 
-  const int uniqueStartY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 132;
+  const int uniqueStartY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 188;
   if (debugUniqueCount == 0) {
     renderer.drawCenteredText(UI_10_FONT_ID, uniqueStartY, "No key presses captured yet");
   } else {
@@ -1160,4 +1172,49 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
+}
+
+void BluetoothSettingsActivity::onLearnInputTrampoline(void* ctx, uint8_t keycode, uint8_t reportIndex) {
+  auto* self = static_cast<BluetoothSettingsActivity*>(ctx);
+  if (self->viewMode == ViewMode::LEARN_KEYS && keycode > 0 && reportIndex != 0xFF) {
+    self->pendingLearnKey = keycode;
+    self->pendingLearnIndex = reportIndex;
+  }
+}
+
+void BluetoothSettingsActivity::onDebugDecodedInputTrampoline(void* ctx, uint8_t keycode, uint8_t reportIndex,
+                                                              uint8_t mappedButton, bool pressed, const uint8_t* raw,
+                                                              uint8_t rawLength) {
+  auto* self = static_cast<BluetoothSettingsActivity*>(ctx);
+  self->debugLastKeycode = keycode;
+  self->debugLastReportIndex = reportIndex;
+  self->debugLastMappedButton = mappedButton;
+  self->debugLastPressed = pressed;
+  self->debugLastRawLength = rawLength > sizeof(self->debugLastRaw) ? sizeof(self->debugLastRaw) : rawLength;
+  if (raw && self->debugLastRawLength > 0) {
+    memcpy(self->debugLastRaw, raw, self->debugLastRawLength);
+  }
+  if (self->debugLastRawLength < sizeof(self->debugLastRaw)) {
+    memset(self->debugLastRaw + self->debugLastRawLength, 0, sizeof(self->debugLastRaw) - self->debugLastRawLength);
+  }
+
+  self->debugEventCount++;
+  self->debugLastEventMs = millis();
+
+  const uint8_t code = keycode;
+  if (!pressed || code == 0x00 || code == 0xFF) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < self->debugUniqueCount; i++) {
+    if (self->debugUniqueKeys[i] == code) {
+      if (self->debugUniqueCounts[i] < 65535) self->debugUniqueCounts[i]++;
+      return;
+    }
+  }
+  if (self->debugUniqueCount < kDebugUniqueKeyMax) {
+    self->debugUniqueKeys[self->debugUniqueCount] = code;
+    self->debugUniqueCounts[self->debugUniqueCount] = 1;
+    self->debugUniqueCount++;
+  }
 }

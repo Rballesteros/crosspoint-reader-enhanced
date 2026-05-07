@@ -7,7 +7,10 @@
 #include <Logging.h>
 
 #include <cstdlib>
+#include <memory>
 #include <new>
+
+#include <esp_heap_caps.h>
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
@@ -43,7 +46,11 @@ struct JpegContext {
 // File I/O callbacks use pFile->fHandle to access the FsFile*,
 // avoiding the need for global file state.
 void* jpegOpen(const char* filename, int32_t* size) {
-  auto f = std::make_unique<FsFile>();
+  std::unique_ptr<FsFile> f(new (std::nothrow) FsFile());
+  if (!f) {
+    LOG_ERR("JPG", "Failed to allocate file handle for JPEG");
+    return nullptr;
+  }
   if (!Storage.openFileForRead("JPG", std::string(filename), *f)) {
     return nullptr;
   }
@@ -333,12 +340,18 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
 bool JpegToFramebufferConverter::getDimensionsStatic(std::string_view imagePath, ImageDimensions& out) {
   size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG || largestBlock < JPEG_DECODER_APPROX_SIZE) {
+    LOG_ERR("JPG", "Not enough heap for JPEG decoder (free=%u maxAlloc=%u needFree=%u needChunk=%u)", freeHeap,
+            largestBlock, MIN_FREE_HEAP_FOR_JPEG, JPEG_DECODER_APPROX_SIZE);
     return false;
   }
 
-  auto jpeg = std::make_unique<JPEGDEC>();
+  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
+  if (!jpeg) {
+    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
+    return false;
+  }
 
   int rc = jpeg->open(std::string(imagePath).c_str(), jpegOpen, jpegClose, jpegRead, jpegSeek, nullptr);
   if (rc != 1) {
@@ -359,12 +372,18 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(std::string_view imagePath,
   LOG_DBG("JPG", "Decoding JPEG: %.*s", static_cast<int>(imagePath.size()), imagePath.data());
 
   size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG) {
-    LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_JPEG);
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (freeHeap < MIN_FREE_HEAP_FOR_JPEG || largestBlock < JPEG_DECODER_APPROX_SIZE) {
+    LOG_ERR("JPG", "Not enough heap for JPEG decoder (free=%u maxAlloc=%u needFree=%u needChunk=%u)", freeHeap,
+            largestBlock, MIN_FREE_HEAP_FOR_JPEG, JPEG_DECODER_APPROX_SIZE);
     return false;
   }
 
-  auto jpeg = std::make_unique<JPEGDEC>();
+  std::unique_ptr<JPEGDEC> jpeg(new (std::nothrow) JPEGDEC());
+  if (!jpeg) {
+    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
+    return false;
+  }
 
   JpegContext ctx;
   ctx.renderer = &renderer;
@@ -447,7 +466,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(std::string_view imagePath,
   ctx.caching = !config.cachePath.empty();
   if (ctx.caching) {
     if (!ctx.cache.allocate(destWidth, destHeight, config.x, config.y)) {
-      LOG_ERR("JPG", "Failed to allocate cache buffer, continuing without caching");
+      LOG_DBG("JPG", "Skipping cache buffer, continuing without caching");
       ctx.caching = false;
     }
   }

@@ -38,15 +38,13 @@ void FontCacheManager::resetStats() {
 
 bool FontCacheManager::isScanning() const { return scanMode_ == ScanMode::Scanning; }
 
-void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::Style style) {
-  scanText_ += text;
+void FontCacheManager::recordText(std::string_view text, int fontId, EpdFontFamily::Style style) {
+  scanText_.append(text.data(), text.size());
   if (scanFontId_ < 0) scanFontId_ = fontId;
   const uint8_t baseStyle = static_cast<uint8_t>(style) & 0x03;
-  const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
   uint32_t cpCount = 0;
-  while (*p) {
-    if ((*p & 0xC0) != 0x80) cpCount++;
-    p++;
+  for (unsigned char c : text) {
+    if ((c & 0xC0) != 0x80) cpCount++;
   }
   scanStyleCounts_[baseStyle] += cpCount;
 }

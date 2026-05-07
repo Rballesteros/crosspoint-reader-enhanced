@@ -1,5 +1,6 @@
 #include "BaseTheme.h"
 
+#include <BluetoothHIDManager.h>
 #include <GfxRenderer.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
@@ -77,6 +78,30 @@ void BaseTheme::drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX,
   renderer.drawLine(boltX + 1, boltY + 5, boltX + 4, boltY + 5, false);
   renderer.drawLine(boltX + 2, boltY + 6, boltX + 3, boltY + 6, false);
   renderer.drawLine(boltX + 1, boltY + 7, boltX + 2, boltY + 7, false);
+}
+
+bool BaseTheme::showBluetoothStatusIndicator() {
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  return SETTINGS.bluetoothEnabled || btMgr.isEnabled() || btMgr.hasConnectedDevice();
+}
+
+bool BaseTheme::isBluetoothStatusConnected() { return BluetoothHIDManager::getInstance().hasConnectedDevice(); }
+
+void BaseTheme::drawBluetoothStatusIcon(const GfxRenderer& renderer, const int x, const int y, const bool connected) {
+  const int top = y;
+  const int stemX = x + 5;
+
+  renderer.drawLine(stemX, top, stemX, top + 13);
+  renderer.drawLine(stemX, top, x + 10, top + 4);
+  renderer.drawLine(x + 10, top + 4, x + 2, top + 8);
+  renderer.drawLine(x + 2, top + 5, x + 10, top + 10);
+  renderer.drawLine(x + 10, top + 10, stemX, top + 13);
+
+  if (connected) {
+    renderer.fillRect(x + 15, top + 5, 5, 5);
+  } else {
+    renderer.drawRect(x + 15, top + 5, 5, 5);
+  }
 }
 
 void BaseTheme::drawBatteryLeft(const GfxRenderer& renderer, Rect rect, const bool showPercentage) const {
@@ -306,7 +331,7 @@ void BaseTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, 
 
 void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle) const {
   // Hide last battery draw
-  constexpr int maxBatteryWidth = 80;
+  constexpr int maxBatteryWidth = 120;
   renderer.fillRect(rect.x + rect.width - maxBatteryWidth, rect.y + 5, maxBatteryWidth,
                     BaseMetrics::values.batteryHeight + 10, false);
 
@@ -314,12 +339,23 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
   // Position icon at right edge, drawBatteryRight will place text to the left
   const int batteryX = rect.x + rect.width - 12 - BaseMetrics::values.batteryWidth;
+  int statusGroupLeftX = batteryX;
+  if (showBatteryPercentage) {
+    const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+    statusGroupLeftX -= renderer.getTextWidth(SMALL_FONT_ID, percentageText.c_str()) + batteryPercentSpacing;
+  }
+  if (showBluetoothStatusIndicator()) {
+    const int iconX = statusGroupLeftX - bluetoothStatusSpacing - bluetoothStatusWidth;
+    const int iconY = rect.y + 5 + 6 + (BaseMetrics::values.batteryHeight - bluetoothStatusHeight) / 2;
+    drawBluetoothStatusIcon(renderer, iconX, iconY, isBluetoothStatusConnected());
+    statusGroupLeftX = iconX;
+  }
   drawBatteryRight(renderer,
                    Rect{batteryX, rect.y + 5, BaseMetrics::values.batteryWidth, BaseMetrics::values.batteryHeight},
                    showBatteryPercentage);
 
   if (title) {
-    int padding = rect.width - batteryX + BaseMetrics::values.batteryWidth;
+    int padding = rect.width - statusGroupLeftX + BaseMetrics::values.contentSidePadding;
     auto truncatedTitle = renderer.truncatedText(UI_12_FONT_ID, title,
                                                  rect.width - padding * 2 - BaseMetrics::values.contentSidePadding * 2,
                                                  EpdFontFamily::BOLD);
@@ -731,11 +767,24 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   // Draw Battery
   const bool showBatteryPercentage =
       SETTINGS.hideBatteryPercentage == CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_NEVER;
+  const int leftStatusX = metrics.statusBarHorizontalMargin + orientedMarginLeft + 1;
+  int leftStatusWidth = 0;
   if (SETTINGS.statusBarBattery) {
     GUI.drawBatteryLeft(renderer,
-                        Rect{metrics.statusBarHorizontalMargin + orientedMarginLeft + 1, textY, metrics.batteryWidth,
-                             metrics.batteryHeight},
+                        Rect{leftStatusX, textY, metrics.batteryWidth, metrics.batteryHeight},
                         showBatteryPercentage);
+    leftStatusWidth = metrics.batteryWidth;
+    if (showBatteryPercentage) {
+      const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+      leftStatusWidth += BaseTheme::batteryPercentSpacing + renderer.getTextWidth(SMALL_FONT_ID, percentageText);
+    }
+  }
+
+  if (showBluetoothStatusIndicator()) {
+    const int iconX = leftStatusX + leftStatusWidth + (leftStatusWidth > 0 ? bluetoothStatusSpacing : 0);
+    const int iconY = textY + 6 + (metrics.batteryHeight - bluetoothStatusHeight) / 2;
+    drawBluetoothStatusIcon(renderer, iconX, iconY, isBluetoothStatusConnected());
+    leftStatusWidth = (iconX - leftStatusX) + bluetoothStatusWidth;
   }
 
   // Draw Title
@@ -746,8 +795,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     const int rendererableScreenWidth =
         renderer.getScreenWidth() - (metrics.statusBarHorizontalMargin * 2) - orientedMarginLeft - orientedMarginRight;
 
-    const int batterySize = SETTINGS.statusBarBattery ? (showBatteryPercentage ? 50 : 20) : 0;
-    const int titleMarginLeft = batterySize + 30;
+    const int titleMarginLeft = leftStatusWidth + 30;
     const int titleMarginRight = progressTextWidth + 30;
 
     // Attempt to center title on the screen, but if title is too wide then later we will center it within the

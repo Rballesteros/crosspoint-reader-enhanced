@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <BluetoothHIDManager.h>
 #include <WiFi.h>
 
 #include "MappedInputManager.h"
@@ -53,9 +54,19 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
 void OtaUpdateActivity::onEnter() {
   Activity::onEnter();
 
+  // Keep this firmware path to one active radio stack at a time so OTA WiFi
+  // setup has a predictable heap budget on the ESP32-C3.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    LOG_INF("OTA", "Disabling Bluetooth before WiFi startup");
+    btMgr.disable();
+    delay(100);  // Brief delay to ensure BLE radio is fully down
+  }
+
   // Turn on WiFi immediately
   LOG_DBG("OTA", "Turning on WiFi...");
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);  // Enable modem sleep for battery saving
 
   // Launch WiFi selection subactivity
   LOG_DBG("OTA", "Launching WifiSelectionActivity...");

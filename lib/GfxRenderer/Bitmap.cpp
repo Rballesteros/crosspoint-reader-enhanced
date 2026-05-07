@@ -1,7 +1,11 @@
 #include "Bitmap.h"
 
+#include <HeapBudget.h>
+#include <Logging.h>
+
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 // ============================================================================
 // IMAGE PROCESSING OPTIONS
@@ -12,6 +16,15 @@
 // For cover images, dithering is done in JpegToBmpConverter.cpp instead.
 constexpr bool USE_ATKINSON = true;  // Use Atkinson dithering instead of Floyd-Steinberg
 // ============================================================================
+
+namespace {
+bool hasHeapForBmpDitherer(const int width, const bool atkinson) {
+  const size_t rowBytes = static_cast<size_t>(width + (atkinson ? 4 : 2)) * sizeof(int16_t);
+  const size_t totalBytes = rowBytes * (atkinson ? 3 : 2);
+  constexpr size_t SAFETY_MARGIN = 8 * 1024;
+  return HeapBudget::canAllocate(totalBytes, rowBytes, SAFETY_MARGIN, "BMP", "BMP ditherer");
+}
+}  // namespace
 
 Bitmap::~Bitmap() {}
 
@@ -161,10 +174,18 @@ BmpReaderError Bitmap::parseHeaders() {
   //  - High-color + dithering disabled → simple quantization (no error diffusion)
   const bool highColor = !nativePalette;
   if (highColor && dithering) {
-    if (USE_ATKINSON) {
-      atkinsonDitherer = std::make_unique<AtkinsonDitherer>(width);
-    } else {
-      fsDitherer = std::make_unique<FloydSteinbergDitherer>(width);
+    if (hasHeapForBmpDitherer(width, USE_ATKINSON)) {
+      if (USE_ATKINSON) {
+        atkinsonDitherer.reset(new (std::nothrow) AtkinsonDitherer(width));
+        if (!atkinsonDitherer) {
+          LOG_DBG("BMP", "BMP Atkinson ditherer allocation failed; using simple quantization");
+        }
+      } else {
+        fsDitherer.reset(new (std::nothrow) FloydSteinbergDitherer(width));
+        if (!fsDitherer) {
+          LOG_DBG("BMP", "BMP Floyd-Steinberg ditherer allocation failed; using simple quantization");
+        }
+      }
     }
   }
 

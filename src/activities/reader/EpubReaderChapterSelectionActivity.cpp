@@ -4,6 +4,7 @@
 #include <I18n.h>
 
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -47,7 +48,7 @@ void EpubReaderChapterSelectionActivity::loop() {
   const int pageItems = getPageItems();
   const int totalItems = getTotalItems();
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
     const auto newSpineIndex = epub->getSpineIndexForTocIndex(selectorIndex);
     if (newSpineIndex == -1) {
       ActivityResult result;
@@ -58,7 +59,7 @@ void EpubReaderChapterSelectionActivity::loop() {
       setResult(ChapterResult{newSpineIndex});
       finish();
     }
-  } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+  } else if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
     setResult(std::move(result));

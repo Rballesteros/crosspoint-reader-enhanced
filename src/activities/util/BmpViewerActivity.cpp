@@ -102,15 +102,33 @@ void BmpViewerActivity::onEnter() {
       GUI.fillPopupProgress(renderer, popupRect, 50);
 
       renderer.clearScreen();
-      // Assuming drawBitmap defaults to 0,0 crop if omitted, or pass explicitly: drawBitmap(bitmap, x, y, pageWidth,
-      // pageHeight, 0, 0)
       renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0);
 
-      // Draw UI hints on the base layer
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-      // Single pass for non-grayscale images
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 
-      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      if (bitmap.hasGreyscale()) {
+        bitmap.rewindToData();
+        renderer.clearScreen(0x00);
+        renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+        renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0);
+        renderer.copyGrayscaleLsbBuffers();
+
+        bitmap.rewindToData();
+        renderer.clearScreen(0x00);
+        renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+        renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0);
+        renderer.copyGrayscaleMsbBuffers();
+
+        renderer.displayGrayBuffer();
+        renderer.setRenderMode(GfxRenderer::BW);
+
+        bitmap.rewindToData();
+        renderer.clearScreen();
+        renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0);
+        GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+        renderer.cleanupGrayscaleWithFrameBuffer();
+      }
 
     } else {
       // Handle file parsing error

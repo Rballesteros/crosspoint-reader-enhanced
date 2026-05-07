@@ -48,6 +48,12 @@ inline bool allowLongPressChapterSkip() {
          !BluetoothHIDManager::getInstance().hadRecentFree2Input();
 }
 
+inline bool preferPressForBleInput() { return BluetoothHIDManager::getInstance().hadRecentFree2Input(); }
+
+inline bool actionTriggered(const MappedInputManager& input, const MappedInputManager::Button button) {
+  return preferPressForBleInput() ? input.wasPressed(button) : input.wasReleased(button);
+}
+
 inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   const bool usePress = !allowLongPressChapterSkip();
   const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
@@ -141,7 +147,7 @@ inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntil
 template <typename RenderFn>
 void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
   if (!renderer.storeBwBuffer()) {
-    LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
+    LOG_DBG("READER", "Skipping AA: BW buffer store failed");
     return;
   }
 

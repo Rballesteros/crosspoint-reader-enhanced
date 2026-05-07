@@ -5,8 +5,10 @@
 #include <InflateReader.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "BitmapHelpers.h"
 
@@ -53,6 +55,20 @@ inline uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
 namespace {
 // PNG constants
 uint8_t PNG_SIGNATURE[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+constexpr size_t PNG_INFLATE_RING_BYTES = 32 * 1024;
+constexpr size_t PNG_CONVERT_SAFETY_MARGIN = 24 * 1024;
+
+bool hasHeapForPngConvert(const size_t totalBytes, const size_t largestBlock, const char* label) {
+  const size_t freeHeap = ESP.getFreeHeap();
+  const size_t maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap < totalBytes + PNG_CONVERT_SAFETY_MARGIN || maxAlloc < largestBlock) {
+    LOG_DBG("PNG", "Skipping %s: free=%u maxAlloc=%u needFree=%u needBlock=%u", label,
+            static_cast<unsigned>(freeHeap), static_cast<unsigned>(maxAlloc),
+            static_cast<unsigned>(totalBytes + PNG_CONVERT_SAFETY_MARGIN), static_cast<unsigned>(largestBlock));
+    return false;
+  }
+  return true;
+}
 
 // PNG color types
 enum PngColorType : uint8_t {
@@ -497,6 +513,12 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOu
     return false;
   }
 
+  if (!hasHeapForPngConvert(static_cast<size_t>(rawRowBytes) * 2 + PNG_INFLATE_RING_BYTES,
+                            std::max(static_cast<size_t>(rawRowBytes), PNG_INFLATE_RING_BYTES),
+                            "PNG scanline buffers")) {
+    return false;
+  }
+
   // Initialize decode context
   PngDecodeContext ctx = {};
   ctx.file = &pngFile;
@@ -600,6 +622,26 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOu
     bytesPerRow = (outWidth * 2 + 31) / 32 * 4;
   }
 
+  const size_t rowBufferBytes = static_cast<size_t>(bytesPerRow);
+  const size_t grayRowBytes = static_cast<size_t>(width);
+  const size_t rowAccumBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint32_t) : 0;
+  const size_t rowCountBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint16_t) : 0;
+  const size_t ditherBytes = USE_8BIT_OUTPUT
+                                 ? 0
+                                 : (oneBit || USE_ATKINSON
+                                        ? static_cast<size_t>(outWidth + 4) * sizeof(int16_t) * 3
+                                        : (USE_FLOYD_STEINBERG
+                                               ? static_cast<size_t>(outWidth + 2) * sizeof(int16_t) * 2
+                                               : 0));
+  size_t largestBlock = std::max(rowBufferBytes, grayRowBytes);
+  largestBlock = std::max(largestBlock, rowAccumBytes);
+  largestBlock = std::max(largestBlock, rowCountBytes);
+  largestBlock = std::max(largestBlock, ditherBytes / 2 + sizeof(int16_t) * 4);
+  const size_t totalWorkingBytes = rowBufferBytes + grayRowBytes + rowAccumBytes + rowCountBytes + ditherBytes;
+  if (!hasHeapForPngConvert(totalWorkingBytes, largestBlock, "PNG BMP output buffers")) {
+    return false;
+  }
+
   // Allocate BMP row buffer
   std::vector<uint8_t> rowBuffer(bytesPerRow, 0);
 
@@ -609,12 +651,24 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOu
   std::unique_ptr<Atkinson1BitDitherer> atkinson1BitDitherer;
 
   if (oneBit) {
-    atkinson1BitDitherer = std::make_unique<Atkinson1BitDitherer>(outWidth);
+    atkinson1BitDitherer.reset(new (std::nothrow) Atkinson1BitDitherer(outWidth));
+    if (!atkinson1BitDitherer) {
+      LOG_DBG("PNG", "Skipping PNG BMP conversion: failed to allocate 1-bit ditherer");
+      return false;
+    }
   } else if (!USE_8BIT_OUTPUT) {
     if (USE_ATKINSON) {
-      atkinsonDitherer = std::make_unique<AtkinsonDitherer>(outWidth);
+      atkinsonDitherer.reset(new (std::nothrow) AtkinsonDitherer(outWidth));
+      if (!atkinsonDitherer) {
+        LOG_DBG("PNG", "Skipping PNG BMP conversion: failed to allocate Atkinson ditherer");
+        return false;
+      }
     } else if (USE_FLOYD_STEINBERG) {
-      fsDitherer = std::make_unique<FloydSteinbergDitherer>(outWidth);
+      fsDitherer.reset(new (std::nothrow) FloydSteinbergDitherer(outWidth));
+      if (!fsDitherer) {
+        LOG_DBG("PNG", "Skipping PNG BMP conversion: failed to allocate Floyd-Steinberg ditherer");
+        return false;
+      }
     }
   }
 

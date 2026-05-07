@@ -50,8 +50,9 @@ struct DeviceProfile {
   // Leave false for standard keyboard/consumer layouts that can safely be superseded.
   bool strictProfile;         // If true, custom profile cannot override this profile
   // Optional menu-action keycodes for clickers with more than two buttons.
-  // 0x00 means "not set" — falls back to existing behavior. Honored only on
-  // non-strict profiles and on user-learned custom profiles.
+  // 0x00 means "not set" — falls back to existing behavior. User-learned
+  // action keys are allowed to override strict profiles in BluetoothHIDManager
+  // so Confirm/Back can remain menu actions while page navigation stays strict.
   uint8_t confirmCode = 0x00; // HID keycode for Confirm/Select action
   uint8_t cancelCode = 0x00;  // HID keycode for Back/Cancel action
 };

@@ -35,7 +35,8 @@ bool extractImageToCacheWithRetries(const Epub& epub, const std::string& resolve
     FsFile cachedImageFile;
     if (!Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
       LOG_ERR("EHP", "Failed to open cached image for write: %s", cachedImagePath.c_str());
-      delay(20 * (attempt + 1));
+      // Retry only on real failure; small backoff before next attempt.
+      if (attempt + 1 < IMAGE_STREAM_CHUNK_SIZES.size()) delay(10);
       continue;
     }
 
@@ -45,13 +46,13 @@ bool extractImageToCacheWithRetries(const Epub& epub, const std::string& resolve
     cachedImageFile.close();
 
     if (extractSuccess) {
-      delay(20);  // Give the SD card time to sync before probing dimensions.
+      // flush() + close() are already a SD barrier; no extra delay needed.
       return true;
     }
 
     LOG_ERR("EHP", "Image extract attempt %u failed for %s (chunk=%u)", static_cast<unsigned>(attempt + 1),
             resolvedPath.c_str(), static_cast<unsigned>(chunkSize));
-    delay(20 * (attempt + 1));
+    if (attempt + 1 < IMAGE_STREAM_CHUNK_SIZES.size()) delay(10);
   }
 
   if (Storage.exists(cachedImagePath.c_str())) {
@@ -66,7 +67,7 @@ bool getImageDimensionsWithRetries(ImageToFramebufferDecoder& decoder, const std
     if (decoder.getDimensions(cachedImagePath, dims)) {
       return true;
     }
-    delay(20 * (attempt + 1));
+    if (attempt + 1 < 3) delay(10);
   }
   return false;
 }
@@ -1132,18 +1133,21 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
       return false;
     }
 
-    const size_t len = file.read(buf, PARSE_BUFFER_SIZE);
+    const int len = file.read(buf, PARSE_BUFFER_SIZE);
 
-    if (len == 0 && file.available() > 0) {
-      LOG_ERR("EHP", "File read error");
-      destroyXmlParser(parser);
-      file.close();
-      return false;
+    if (len <= 0) {
+      if (len < 0 || file.available() > 0) {
+        LOG_ERR("EHP", "File read error");
+        destroyXmlParser(parser);
+        file.close();
+        return false;
+      }
+      done = 1;
+    } else {
+      done = file.available() == 0;
     }
 
-    done = file.available() == 0;
-
-    if (XML_ParseBuffer(parser, static_cast<int>(len), done) == XML_STATUS_ERROR) {
+    if (XML_ParseBuffer(parser, len, done) == XML_STATUS_ERROR) {
       LOG_ERR("EHP", "Parse error at line %lu:\n%s", XML_GetCurrentLineNumber(parser),
               XML_ErrorString(XML_GetErrorCode(parser)));
       destroyXmlParser(parser);

@@ -145,6 +145,18 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
   // Position icon at right edge, drawBatteryRight will place text to the left
   const int batteryX = rect.x + rect.width - 12 - LyraMetrics::values.batteryWidth;
+  int statusGroupLeftX = batteryX;
+  if (showBatteryPercentage) {
+    const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+    statusGroupLeftX -= renderer.getTextWidth(SMALL_FONT_ID, percentageText.c_str()) + BaseTheme::batteryPercentSpacing;
+  }
+  if (BaseTheme::showBluetoothStatusIndicator()) {
+    const int iconX = statusGroupLeftX - BaseTheme::bluetoothStatusSpacing - BaseTheme::bluetoothStatusWidth;
+    const int iconY =
+        rect.y + 5 + 6 + (LyraMetrics::values.batteryHeight - BaseTheme::bluetoothStatusHeight) / 2;
+    BaseTheme::drawBluetoothStatusIcon(renderer, iconX, iconY, BaseTheme::isBluetoothStatusConnected());
+    statusGroupLeftX = iconX;
+  }
   drawBatteryRight(renderer,
                    Rect{batteryX, rect.y + 5, LyraMetrics::values.batteryWidth, LyraMetrics::values.batteryHeight},
                    showBatteryPercentage);
@@ -154,7 +166,9 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
       subtitle != nullptr ? renderer.getTextWidth(SMALL_FONT_ID, subtitle, EpdFontFamily::REGULAR) : 0;
 
   // Available space is the distance between the side paddings, and a with side padding between title and subtitle.
-  const int availableSpace = rect.width - LyraMetrics::values.contentSidePadding * 3;
+  const int statusReservedWidth = rect.x + rect.width - statusGroupLeftX;
+  const int availableSpace =
+      rect.width - LyraMetrics::values.contentSidePadding * 3 - statusReservedWidth;
 
   if (maxTitleWidth + maxSubtitleWidth > availableSpace) {
     if ((maxTitleWidth > availableSpace / 2) && (maxSubtitleWidth > availableSpace / 2)) {

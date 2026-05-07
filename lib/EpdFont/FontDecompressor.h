@@ -73,7 +73,9 @@ class FontDecompressor {
     uint16_t groupIndex = UINT16_MAX;
     const EpdFontData* fontData = nullptr;
   };
-  static constexpr uint8_t MAX_HOT_GROUPS = 2;
+  // Each hot group can be several KB. On a 380KB-RAM C3 with no PSRAM, keep this at 1
+  // so the inflate dictionary (32KB) and section build buffers have headroom.
+  static constexpr uint8_t MAX_HOT_GROUPS = 1;
   HotGroup hotGroups[MAX_HOT_GROUPS];
   uint8_t hotGroupMruIdx = 0;
 

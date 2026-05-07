@@ -1,5 +1,6 @@
 #include "ImageBlock.h"
 
+#include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -86,6 +87,13 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
 }  // namespace
 
 void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
+  // The font-prewarm scan pass walks every block to collect text for font caching.
+  // Images contribute nothing — short-circuit to avoid an entire JPEG decode (~137ms
+  // per image) on a render pass whose output is discarded. Saves one of the three
+  // decodes that happen for an image-bearing AA page.
+  auto* fcm = renderer.getFontCacheManager();
+  if (fcm && fcm->isScanning()) return;
+
   LOG_DBG("IMG", "Rendering image at %d,%d: %s (%dx%d)", x, y, imagePath.c_str(), width, height);
 
   const int screenWidth = renderer.getScreenWidth();

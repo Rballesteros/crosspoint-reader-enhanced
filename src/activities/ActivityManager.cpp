@@ -88,6 +88,12 @@ void ActivityManager::loop() {
         stackActivities.pop_back();
         LOG_DBG("ACT", "Popped from activity stack, new size = %zu", stackActivities.size());
 
+        size_t currentHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        int diff = static_cast<int>(currentHeap) - static_cast<int>(lastHeapValue);
+        LOG_INF("ACT", "RESUME: heap diff: %d bytes (now: %uK)", diff, static_cast<unsigned>(currentHeap / 1024));
+        lastHeapValue = currentHeap;
+        recordHeapSample();
+
         // Notify activity it is back in foreground
         currentActivity->onResume();
 
@@ -134,6 +140,12 @@ void ActivityManager::loop() {
 
       lock.unlock();  // onEnter may acquire its own lock
       currentActivity->onEnter();
+
+      size_t currentHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+      int diff = static_cast<int>(currentHeap) - static_cast<int>(lastHeapValue);
+      LOG_INF("ACT", "ENTER: heap diff: %d bytes (now: %uK)", diff, static_cast<unsigned>(currentHeap / 1024));
+      lastHeapValue = currentHeap;
+      recordHeapSample();
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;

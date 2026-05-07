@@ -117,6 +117,7 @@ public:
   bool isDebugCaptureEnabled() const { return _debugCaptureEnabled; }
   void setBondedDevice(const std::string& address, const std::string& name = "", uint8_t addrType = 0);
   void updateActivity();  // Call periodically to check inactivity timeout
+  unsigned long lastDisconnectTime() const;
   void checkAutoReconnect(bool userInputDetected = false);  // Reconnect bonded device when disconnected
 
   // Check if BLE has had activity recently (within last 4 minutes)

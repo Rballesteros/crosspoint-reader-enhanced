@@ -6,6 +6,7 @@
 
 #include "activities/Activity.h"
 #include "MappedInputManager.h"
+#include "util/ButtonNavigator.h"
 
 class BluetoothSettingsActivity : public Activity {
  private:
@@ -44,7 +45,13 @@ class BluetoothSettingsActivity : public Activity {
   uint16_t learnTestForwardCount = 0;
   uint16_t learnTestBackCount = 0;
   uint16_t debugLastKeycode = 0;
+  uint8_t debugLastReportIndex = 0xFF;
+  uint8_t debugLastMappedButton = 0xFF;
+  bool debugLastPressed = false;
+  uint8_t debugLastRaw[8] = {0};
+  uint8_t debugLastRawLength = 0;
   uint32_t debugEventCount = 0;
+  uint32_t debugRenderedEventCount = 0;
   unsigned long debugLastEventMs = 0;
   static constexpr uint8_t kDebugUniqueKeyMax = 8;
   uint8_t debugUniqueKeys[kDebugUniqueKeyMax] = {0};
@@ -56,6 +63,7 @@ class BluetoothSettingsActivity : public Activity {
   std::string highlightedAddress;            // BLE address the cursor is "on" (so sort doesn't lose it)
   bool showOnlyHID = false;                  // Filter list to HID-advertising devices only
   unsigned long lastDeviceListRefresh = 0;   // millis() of last live re-render during scan
+  ButtonNavigator buttonNavigator;
 
  public:
   explicit BluetoothSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -80,6 +88,12 @@ class BluetoothSettingsActivity : public Activity {
   void renderLearnKeys();
   void renderDebugMonitor();
   std::string getSignalStrengthIndicator(const int32_t rssi) const;
+
+  // Trampolines for BluetoothHIDManager raw fn-ptr callbacks (avoids
+  // std::function heap/binary cost). Cast ctx back to instance pointer.
+  static void onLearnInputTrampoline(void* ctx, uint8_t keycode, uint8_t reportIndex);
+  static void onDebugDecodedInputTrampoline(void* ctx, uint8_t keycode, uint8_t reportIndex, uint8_t mappedButton,
+                                            bool pressed, const uint8_t* raw, uint8_t rawLength);
 
   const std::function<void()> onComplete;
 };

@@ -10,6 +10,7 @@
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -361,7 +362,7 @@ void KOReaderSyncActivity::render(RenderLock&&) {
 
 void KOReaderSyncActivity::loop() {
   if (state == NO_CREDENTIALS || state == SYNC_FAILED || state == UPLOAD_COMPLETE) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
       ActivityResult result;
       result.isCancelled = true;
       setResult(std::move(result));
@@ -382,7 +383,7 @@ void KOReaderSyncActivity::loop() {
       requestUpdate();
     }
 
-    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
       if (selectedOption == 0) {
         // Wifi will be turned off in onExit()
         setResult(SyncResult{remotePosition.spineIndex, remotePosition.pageNumber});
@@ -393,7 +394,7 @@ void KOReaderSyncActivity::loop() {
       }
     }
 
-    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
       ActivityResult result;
       result.isCancelled = true;
       setResult(std::move(result));
@@ -403,7 +404,7 @@ void KOReaderSyncActivity::loop() {
   }
 
   if (state == NO_REMOTE_PROGRESS) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
       // Calculate hash if not done yet
       if (documentHash.empty()) {
         if (KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME) {
@@ -415,7 +416,7 @@ void KOReaderSyncActivity::loop() {
       performUpload();
     }
 
-    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Back)) {
       ActivityResult result;
       result.isCancelled = true;
       setResult(std::move(result));

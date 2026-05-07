@@ -4,7 +4,9 @@
 #include <qrcode.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
+#include <new>
 
 #include "Logging.h"
 
@@ -17,17 +19,21 @@ void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, std::s
 
   // Truncate to max QR capacity at a UTF-8 safe boundary to avoid splitting multi-byte sequences
   static constexpr size_t MAX_QR_CAPACITY = 2953;  // Version 40, ECC_LOW, byte mode
-  std::string truncated;
-  const char* payload = textPayload.data();
   if (len > MAX_QR_CAPACITY) {
     len = utf8SafeTruncateBuffer(textPayload.data(), static_cast<int>(MAX_QR_CAPACITY));
-    truncated = std::string(textPayload.substr(0, len));
-    payload = truncated.c_str();
-  } else if (textPayload[len] != '\0') {
-    // qrcode_initText needs a null-terminated string
-    truncated = std::string(textPayload);
-    payload = truncated.c_str();
   }
+
+  // qrcode_initText is a C API that requires a null-terminated payload.
+  // The payload can be nearly 3KB, so keep it off the small ESP32-C3 stack.
+  std::unique_ptr<char[]> payloadBuf(new (std::nothrow) char[len + 1]);
+  if (!payloadBuf) {
+    LOG_ERR("QR", "Failed to allocate QR payload buffer (%u bytes)", static_cast<unsigned>(len + 1));
+    return;
+  }
+  if (len > 0) {
+    memcpy(payloadBuf.get(), textPayload.data(), len);
+  }
+  payloadBuf[len] = '\0';
 
   int version = 4;
   if (len > 114) version = 10;
@@ -35,13 +41,17 @@ void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, std::s
   if (len > 1066) version = 30;
   if (len > 2110) version = 40;
 
-  // Make sure we have a large enough buffer on the heap to avoid blowing the stack
+  // Make sure we have a large enough buffer on the heap to avoid blowing the stack.
   uint32_t bufferSize = qrcode_getBufferSize(version);
-  auto qrcodeBytes = std::make_unique<uint8_t[]>(bufferSize);
+  std::unique_ptr<uint8_t[]> qrcodeBytes(new (std::nothrow) uint8_t[bufferSize]);
+  if (!qrcodeBytes) {
+    LOG_ERR("QR", "Failed to allocate QR work buffer (%u bytes)", static_cast<unsigned>(bufferSize));
+    return;
+  }
 
   QRCode qrcode;
   // Initialize the QR code. We use ECC_LOW for max capacity.
-  int8_t res = qrcode_initText(&qrcode, qrcodeBytes.get(), version, ECC_LOW, payload);
+  int8_t res = qrcode_initText(&qrcode, qrcodeBytes.get(), version, ECC_LOW, payloadBuf.get());
 
   if (res == 0) {
     // Determine the optimal pixel size.

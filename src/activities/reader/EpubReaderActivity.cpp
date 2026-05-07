@@ -873,19 +873,17 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
-  // Save BW buffer only when the grayscale AA pass needs it. When BLE is connected,
-  // the extra scratch copy can fail under runtime memory pressure; in that case,
-  // keep the already-displayed BW page and skip AA for this render.
+  // Try to save the BW buffer for fast restore after the grayscale pass. This
+  // is purely a speed optimization — AA itself doesn't need it. If the alloc
+  // fails (e.g. BT is connected and heap is tight), proceed with AA anyway and
+  // re-render the page after grayscale via the fallback path below. Costs one
+  // extra page render (~100-300ms) but keeps AA enabled in low-heap conditions.
   bool bwBufferStored = false;
   if (SETTINGS.textAntiAliasing) {
     bwBufferStored = renderer.storeBwBuffer();
     if (!bwBufferStored) {
-      const auto tEnd = millis();
-      LOG_DBG("ERS", "Skipping AA: BW buffer store failed, free heap=%lu", esp_get_free_heap_size());
-      LOG_DBG("ERS",
-              "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store_fail=%lums total=%lums",
-              tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - tDisplay, tEnd - t0);
-      return;
+      LOG_DBG("ERS", "BW buffer store failed; AA will use re-render fallback (free heap=%lu)",
+              esp_get_free_heap_size());
     }
   }
   const auto tBwStore = millis();

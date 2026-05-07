@@ -1,6 +1,7 @@
 #include "ZipFile.h"
 
 #include <HalStorage.h>
+#include <HeapBudget.h>
 #include <InflateReader.h>
 #include <Logging.h>
 
@@ -17,6 +18,11 @@ struct ZipInflateCtx {
 namespace {
 constexpr uint16_t ZIP_METHOD_STORED = 0;
 constexpr uint16_t ZIP_METHOD_DEFLATED = 8;
+constexpr size_t ZIP_ALLOC_SAFETY_MARGIN = 16 * 1024;
+
+bool hasZipHeap(const size_t totalBytes, const size_t largestBlock, const char* label) {
+  return HeapBudget::canAllocate(totalBytes, largestBlock, ZIP_ALLOC_SAFETY_MARGIN, "ZIP", label);
+}
 
 // RAII zip: opens the zip if not already open, closes on destruction only if
 // it performed the open.  Removes the wasOpen/close boilerplate from every method.
@@ -45,10 +51,11 @@ int zipReadCallback(uzlib_uncomp* uncomp) {
   if (ctx->fileRemaining == 0) return -1;
 
   const size_t toRead = ctx->fileRemaining < ctx->readBufSize ? ctx->fileRemaining : ctx->readBufSize;
-  const size_t bytesRead = ctx->file->read(ctx->readBuf, toRead);
-  ctx->fileRemaining -= bytesRead;
+  const int bytesRead = ctx->file->read(ctx->readBuf, toRead);
 
-  if (bytesRead == 0) return -1;
+  if (bytesRead <= 0) return -1;
+
+  ctx->fileRemaining -= static_cast<size_t>(bytesRead);
 
   uncomp->source = ctx->readBuf + 1;
   uncomp->source_limit = ctx->readBuf + bytesRead;
@@ -67,7 +74,7 @@ bool ZipFile::loadAllFileStatSlims() {
   uint32_t sig;
   char itemName[256];
   fileStatSlimCache.clear();
-  fileStatSlimCache.reserve(zipDetails.totalEntries);
+  // std::map has no reserve(); kept transparent for string_view lookups (no per-call alloc).
 
   while (file.available()) {
     file.read(&sig, 4);
@@ -109,7 +116,7 @@ bool ZipFile::loadAllFileStatSlims() {
 
 bool ZipFile::loadFileStatSlim(std::string_view filename, FileStatSlim* fileStat) {
   if (!fileStatSlimCache.empty()) {
-    const auto it = fileStatSlimCache.find(std::string(filename));
+    const auto it = fileStatSlimCache.find(filename);
     if (it != fileStatSlimCache.end()) {
       *fileStat = it->second;
       return true;
@@ -373,6 +380,15 @@ std::vector<uint8_t> ZipFile::readFileToMemory(std::string_view filename, const 
   const auto deflatedDataSize = fileStat.compressedSize;
   const auto inflatedDataSize = fileStat.uncompressedSize;
   const auto dataSize = trailingNullByte ? inflatedDataSize + 1 : inflatedDataSize;
+  const size_t totalNeeded = fileStat.method == ZIP_METHOD_DEFLATED
+                                 ? static_cast<size_t>(dataSize) + static_cast<size_t>(deflatedDataSize)
+                                 : static_cast<size_t>(dataSize);
+  const size_t largestNeeded = fileStat.method == ZIP_METHOD_DEFLATED
+                                  ? std::max(static_cast<size_t>(dataSize), static_cast<size_t>(deflatedDataSize))
+                                  : static_cast<size_t>(dataSize);
+  if (!hasZipHeap(totalNeeded, largestNeeded, "readFileToMemory buffers")) {
+    return {};
+  }
   std::vector<uint8_t> data(dataSize);
 
   if (fileStat.method == ZIP_METHOD_STORED) {
@@ -434,6 +450,9 @@ bool ZipFile::readFileToStream(std::string_view filename, Print& out, const size
   const auto inflatedDataSize = fileStat.uncompressedSize;
 
   if (fileStat.method == ZIP_METHOD_STORED) {
+    if (!hasZipHeap(chunkSize, chunkSize, "stored stream buffer")) {
+      return false;
+    }
     // no deflation, just read content
     std::vector<uint8_t> buffer(chunkSize);
 
@@ -456,6 +475,10 @@ bool ZipFile::readFileToStream(std::string_view filename, Print& out, const size
   }
 
   if (fileStat.method == ZIP_METHOD_DEFLATED) {
+    const size_t dictSize = std::min(static_cast<size_t>(32768), static_cast<size_t>(inflatedDataSize));
+    if (!hasZipHeap(chunkSize * 2 + dictSize, std::max(chunkSize, dictSize), "deflated stream buffers")) {
+      return false;
+    }
     std::vector<uint8_t> fileReadBuffer(chunkSize);
     std::vector<uint8_t> outputBuffer(chunkSize);
 
@@ -468,7 +491,6 @@ bool ZipFile::readFileToStream(std::string_view filename, Print& out, const size
     // Decompressing in chunks requires a dictionary (ring buffer) to resolve
     // back-references. Standard DEFLATE allows distances up to 32KB, but for
     // small files we only need a buffer as large as the total uncompressed size.
-    const size_t dictSize = std::min(static_cast<size_t>(32768), static_cast<size_t>(inflatedDataSize));
     if (!ctx.reader.init(true, dictSize)) {
       LOG_ERR("ZIP", "Failed to init inflate reader (dictSize=%u)", static_cast<unsigned>(dictSize));
       return false;

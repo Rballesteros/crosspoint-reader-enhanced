@@ -306,8 +306,6 @@ bool mapCommonCodeToDirection(uint8_t code, bool& pageForward) {
     case KEYBOARD_PAGE_DOWN:
     case KEYBOARD_DOWN_ARROW:
     case KEYBOARD_RIGHT_ARROW:
-    case KEYBOARD_SPACE:
-    case KEYBOARD_ENTER:
     case KEYBOARD_VOLUME_UP:
     case FREE2_FORWARD_A:
     case FREE2_FORWARD_B:

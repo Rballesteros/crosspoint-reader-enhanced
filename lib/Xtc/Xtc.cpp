@@ -12,6 +12,7 @@
 #include <Logging.h>
 
 #include <algorithm>
+#include <memory>
 #include <new>
 
 namespace {
@@ -231,7 +232,7 @@ bool Xtc::load() {
   LOG_DBG("XTC", "Loading XTC: %s", filepath.c_str());
 
   // Initialize parser
-  parser.reset(new xtc::XtcParser());
+  parser = std::make_unique<xtc::XtcParser>();
 
   // Open XTC file
   xtc::XtcError err = parser->open(filepath.c_str());

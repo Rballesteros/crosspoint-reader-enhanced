@@ -329,6 +329,7 @@ def update_graph(frame) -> list:  # pylint: disable=unused-argument
         x = list(time_data)
         y_free = list(free_mem_data)
         y_total = list(total_mem_data)
+        y_min_free = list(min_free_mem_data)
         y_max_alloc = list(max_alloc_data)
 
     fig = plt.gcf()
@@ -337,6 +338,8 @@ def update_graph(frame) -> list:  # pylint: disable=unused-argument
 
     ax1.plot(x, y_total, label="Total RAM (KB)", color="red", linestyle="--")
     ax1.plot(x, y_free, label="Free RAM (KB)", color="green", marker="o", markersize=3)
+    if any(v > 0 for v in y_min_free):
+        ax1.plot(x, y_min_free, label="Min Free (KB)", color="blue", linestyle=":")
     if any(v > 0 for v in y_max_alloc):
         ax1.plot(x, y_max_alloc, label="Max Alloc (KB)", color="orange", linestyle="-.")
     ax1.fill_between(x, y_free, color="green", alpha=0.1)
