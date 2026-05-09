@@ -23,6 +23,7 @@
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
+#include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
@@ -35,7 +36,8 @@ MappedInputManager mappedInputManager(gpio);
 GfxRenderer renderer(display);
 ActivityManager activityManager(renderer, mappedInputManager);
 FontDecompressor fontDecompressor;
-FontCacheManager fontCacheManager(renderer.getFontMap());
+SdCardFontSystem sdFontSystem;
+FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
 static volatile bool gBluetoothReaderContext = false;
 
 // Fonts
@@ -156,6 +158,8 @@ void enterDeepSleep() {
   powerManager.startDeepSleep(gpio);
 }
 
+void ensureSdFontLoaded() { sdFontSystem.ensureLoaded(renderer); }
+
 void setupDisplayAndFonts() {
   display.begin();
   renderer.begin();
@@ -186,6 +190,10 @@ void setupDisplayAndFonts() {
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
+
+  // Discover and load SD card fonts
+  sdFontSystem.begin(renderer);
+
   LOG_DBG("MAIN", "Fonts setup");
 }
 
@@ -455,7 +463,9 @@ void loop() {
   }
 
   static bool screenshotButtonsReleased = true;
+  static bool screenshotComboActive = false;
   if (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.isPressed(HalGPIO::BTN_DOWN)) {
+    screenshotComboActive = true;
     if (screenshotButtonsReleased) {
       screenshotButtonsReleased = false;
       {
@@ -464,8 +474,16 @@ void loop() {
       }
     }
     return;
-  } else {
+  }
+  if (screenshotComboActive) {
+    if (gpio.isPressed(HalGPIO::BTN_POWER)) return;
+    if (gpio.wasReleased(HalGPIO::BTN_POWER)) {
+      screenshotButtonsReleased = true;
+      screenshotComboActive = false;
+      return;
+    }
     screenshotButtonsReleased = true;
+    screenshotComboActive = false;
   }
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();

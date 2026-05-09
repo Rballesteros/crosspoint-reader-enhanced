@@ -18,9 +18,11 @@
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnotesActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
+#include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
+#include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
@@ -440,7 +442,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           section.reset();
           epub->clearCache();
           epub->setupCacheDir();
-          saveProgress(backupSpine, backupPage, backupPageCount);
+          if (!saveProgress(backupSpine, backupPage, backupPageCount)) {
+            LOG_ERR("ERS", "Failed to save progress before cache clear");
+          }
         }
       }
       activityManager.goHome();
@@ -466,23 +470,42 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             paragraphIndex = *pIdx;
           }
         }
-        startActivityForResult(
-            std::make_unique<KOReaderSyncActivity>(renderer, mappedInput, epub, epub->getPath(), currentSpineIndex,
-                                                   currentPage, totalPages, paragraphIndex),
-            [this](const ActivityResult& result) {
-              if (!result.isCancelled) {
-                const auto& sync = std::get<SyncResult>(result.data);
-                if (currentSpineIndex != sync.spineIndex || (section && section->currentPage != sync.page)) {
-                  RenderLock lock(*this);
-                  currentSpineIndex = sync.spineIndex;
-                  nextPageNumber = sync.page;
-                  cachedChapterTotalPageCount = 0;  // Prevent rescaling sync page
-                  pendingPageJump.reset();
-                  saveProgress(currentSpineIndex, nextPageNumber, 0);
-                  section.reset();
-                }
-              }
-            });
+
+        // Pre-compute local KO position and chapter name while Epub is still in RAM.
+        CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPages};
+        if (paragraphIndex.has_value()) {
+          localPos.paragraphIndex = *paragraphIndex;
+          localPos.hasParagraphIndex = true;
+        }
+        KOReaderPosition localKoPos = ProgressMapper::toKOReader(epub, localPos);
+        const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
+        std::string localChapterName = (tocIdx >= 0) ? epub->getTocItem(tocIdx).title : "";
+        const std::string savedEpubPath = epub->getPath();
+
+        // Persist current position so the reader resumes at the right page on return.
+        // goToReader() depends on this file, so abort the sync if the write fails.
+        if (!saveProgress(currentSpineIndex, currentPage, totalPages)) {
+          LOG_ERR("KOSync", "Aborting sync because current progress could not be saved");
+          pendingSyncSaveError = true;
+          requestUpdate();
+          return;
+        }
+
+        // Release Epub and Section to free ~65KB RAM for the TLS handshake.
+        LOG_DBG("KOSync", "Releasing epub for sync (heap before: %u)", (unsigned)ESP.getFreeHeap());
+        {
+          RenderLock lock(*this);
+          if (section) {
+            nextPageNumber = section->currentPage;
+          }
+          section.reset();
+          epub.reset();
+        }
+        LOG_DBG("KOSync", "Epub released (heap after: %u)", (unsigned)ESP.getFreeHeap());
+
+        activityManager.replaceActivity(std::make_unique<KOReaderSyncActivity>(
+            renderer, mappedInput, savedEpubPath, currentSpineIndex, currentPage, totalPages, std::move(localKoPos),
+            std::move(localChapterName), paragraphIndex));
       }
       break;
     }
@@ -577,6 +600,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  const auto showPendingSyncSaveError = [this]() {
+    if (!pendingSyncSaveError) return;
+    pendingSyncSaveError = false;
+    GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
+  };
+
   // edge case handling for sub-zero spine index
   if (currentSpineIndex < 0) {
     currentSpineIndex = 0;
@@ -592,6 +621,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
     automaticPageTurnActive = false;
+    showPendingSyncSaveError();
     return;
   }
 
@@ -633,6 +663,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       if (auto* fcm = renderer.getFontCacheManager()) {
         fcm->clearCache();
       }
+      GUI.drawPopup(renderer, tr(STR_INDEXING));
+
 
       const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
 
@@ -642,6 +674,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                       SETTINGS.imageRendering, popupFn)) {
         LOG_ERR("ERS", "Failed to persist page data to SD");
         section.reset();
+        showPendingSyncSaveError();
         return;
       }
     } else {
@@ -705,6 +738,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
+    showPendingSyncSaveError();
     return;
   }
 
@@ -714,6 +748,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
+    showPendingSyncSaveError();
     return;
   }
 
@@ -737,6 +772,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         renderer.displayBuffer();
       }
       automaticPageTurnActive = false;
+      showPendingSyncSaveError();
       return;
     }
     
@@ -752,6 +788,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
+
+  showPendingSyncSaveError();
 
   if (pendingScreenshot) {
     pendingScreenshot = false;
@@ -791,40 +829,21 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
   }
 }
 
-void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
-  FsFile f;
-  if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[6];
-    data[0] = spineIndex & 0xFF;
-    data[1] = (spineIndex >> 8) & 0xFF;
-    data[2] = currentPage & 0xFF;
-    data[3] = (currentPage >> 8) & 0xFF;
-    data[4] = pageCount & 0xFF;
-    data[5] = (pageCount >> 8) & 0xFF;
-    f.write(data, 6);
-    LOG_DBG("ERS", "Progress saved: Chapter %d, Page %d", spineIndex, currentPage);
-  } else {
-    LOG_ERR("ERS", "Could not save progress!");
-  }
+bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
+  return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
 }
+
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
                                         const int orientedMarginLeft) {
   const auto t0 = millis();
-  auto* fcm = renderer.getFontCacheManager();
-  fcm->resetStats();
 
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
-  const uint32_t heapBefore = esp_get_free_heap_size();
+  auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
   scope.endScanAndPrewarm();
-  const uint32_t heapAfter = esp_get_free_heap_size();
-  fcm->logStats("prewarm");
   const auto tPrewarm = millis();
-
-  LOG_DBG("ERS", "Heap: before=%lu after=%lu delta=%ld", heapBefore, heapAfter,
-          (int32_t)heapAfter - (int32_t)heapBefore);
 
   // Force special handling for pages with images when anti-aliasing is on
   bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
@@ -839,7 +858,6 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
-  fcm->logStats("bw_render");
   const auto tBwRender = millis();
 
   if (imagePageWithAA) {
