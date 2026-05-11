@@ -6,6 +6,7 @@
 
 #include <cassert>
 
+#include "BluetoothHIDManager.h"
 #include "HalGPIO.h"
 
 HalPowerManager powerManager;  // Singleton instance
@@ -31,8 +32,8 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   }
 
   auto wifiMode = WiFi.getMode();
-  if (wifiMode != WIFI_MODE_NULL) {
-    // Wifi is active, force disabling power saving
+  if (wifiMode != WIFI_MODE_NULL || BluetoothHIDManager::getInstance().isEnabled()) {
+    // Wifi or Bluetooth is active, force disabling power saving
     enabled = false;
   }
 
