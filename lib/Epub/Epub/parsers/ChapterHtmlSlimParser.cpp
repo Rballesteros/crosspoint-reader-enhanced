@@ -195,7 +195,8 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
     anchorData.push_back({std::move(pendingAnchorId), static_cast<uint16_t>(completedPageCount)});
     pendingAnchorId.clear();
   }
-  currentTextBlock = std::make_unique<ParsedText>(extraParagraphSpacing, hyphenationEnabled, blockStyle);
+  currentTextBlock =
+      std::make_unique<ParsedText>(extraParagraphSpacing, hyphenationEnabled, focusReadingEnabled, blockStyle);
   wordsExtractedInBlock = 0;
 }
 
