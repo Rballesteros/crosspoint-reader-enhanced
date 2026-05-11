@@ -142,10 +142,15 @@ void TxtReaderActivity::initializeReader() {
 
 void TxtReaderActivity::buildPageIndex() {
   pageOffsets.clear();
-  pageOffsets.push_back(0);  // First page starts at offset 0
 
   size_t offset = 0;
   const size_t fileSize = txt->getFileSize();
+
+  // Reserve to avoid repeated heap doublings on large files. ~2KB/page is a
+  // conservative estimate; cap so we don't reserve absurdly for huge files.
+  const size_t estimatedPages = std::min(static_cast<size_t>(fileSize / 2048 + 16), static_cast<size_t>(8192));
+  pageOffsets.reserve(estimatedPages);
+  pageOffsets.push_back(0);  // First page starts at offset 0
 
   LOG_DBG("TRS", "Building page index for %zu bytes...", fileSize);
 
@@ -247,9 +252,17 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
         break;
       }
 
-      // Find break point
+      // Find break point. Measure prefixes by temporarily null-terminating
+      // line in place to avoid an allocation per iteration.
       size_t breakPos = line.length();
-      while (breakPos > 0 && renderer.getTextWidth(cachedFontId, line.substr(0, breakPos).c_str()) > viewportWidth) {
+      while (breakPos > 0) {
+        const char saved = line[breakPos];
+        line[breakPos] = '\0';
+        const int prefixWidth = renderer.getTextWidth(cachedFontId, line.c_str());
+        line[breakPos] = saved;
+        if (prefixWidth <= viewportWidth) {
+          break;
+        }
         // Try to break at space
         size_t spacePos = line.rfind(' ', breakPos - 1);
         if (spacePos != std::string::npos && spacePos > 0) {
@@ -268,7 +281,7 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
         breakPos = 1;
       }
 
-      outLines.push_back(line.substr(0, breakPos));
+      outLines.emplace_back(line.data(), breakPos);
 
       // Skip space at break point
       size_t skipChars = breakPos;
@@ -276,7 +289,7 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
         skipChars++;
       }
       lineBytePos += skipChars;
-      line = line.substr(skipChars);
+      line.erase(0, skipChars);
     } while (!line.empty() && static_cast<int>(outLines.size()) < linesPerPage);
 
     // Determine how much of the source buffer we consumed

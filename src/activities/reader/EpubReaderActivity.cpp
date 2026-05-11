@@ -178,7 +178,9 @@ void EpubReaderActivity::loop() {
       chapterNumber = tocIndex + 1;
       chapterCount = epub->getTocItemsCount();
     } else {
-      chapterTitle = std::string(tr(STR_SECTION_PREFIX)) + std::to_string(currentSpineIndex + 1);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "%s%d", tr(STR_SECTION_PREFIX), currentSpineIndex + 1);
+      chapterTitle = buf;
       chapterNumber = currentSpineIndex + 1;
       chapterCount = epub->getSpineItemsCount();
     }
@@ -966,7 +968,10 @@ void EpubReaderActivity::renderStatusBar() const {
   int textYOffset = 0;
 
   if (automaticPageTurnActive) {
-    title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s%lu", tr(STR_AUTO_TURN_ENABLED),
+             static_cast<unsigned long>(60UL * 1000UL / pageTurnDuration));
+    title = buf;
 
     // calculates textYOffset when rendering title in status bar
     const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();

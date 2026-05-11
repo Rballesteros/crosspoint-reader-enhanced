@@ -153,7 +153,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const uint8_t imageRendering, const std::function<void()>& popupFn,
                                 const bool failOnSupportedImageErrors) {
   const auto localPath = epub->getSpineItem(spineIndex).href;
-  const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
+  char spineSuffix[32];
+  snprintf(spineSuffix, sizeof(spineSuffix), "/.tmp_%d.html", spineIndex);
+  const auto tmpHtmlPath = epub->getCachePath() + spineSuffix;
 
   // Create cache directory if it doesn't exist
   {
@@ -207,12 +209,15 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   }
   writeSectionFileHeader(fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
                          viewportHeight, hyphenationEnabled, embeddedStyle, imageRendering);
-  std::vector<PageLutEntry> lut = {};
+  std::vector<PageLutEntry> lut;
+  lut.reserve(64);  // Typical chapter is 5-50 pages; covers common case without growth.
 
   // Derive the content base directory and image cache path prefix for the parser
   size_t lastSlash = localPath.find_last_of('/');
   std::string contentBase = (lastSlash != std::string::npos) ? localPath.substr(0, lastSlash + 1) : "";
-  std::string imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
+  char imgSuffix[32];
+  snprintf(imgSuffix, sizeof(imgSuffix), "/img_%d_", spineIndex);
+  std::string imageBasePath = epub->getCachePath() + imgSuffix;
 
   CssParser* cssParser = nullptr;
   if (embeddedStyle) {
