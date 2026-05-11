@@ -26,7 +26,7 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
 
 std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes) {
   std::vector<MenuItem> items;
-  items.reserve(10);
+  items.reserve(12);
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
@@ -116,33 +116,29 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
       contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, truncTitle.c_str(), EpdFontFamily::BOLD)) / 2;
   renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, truncTitle.c_str(), true, EpdFontFamily::BOLD);
 
-  // Chapter and progress summary
-  std::string chapterLine;
-  if (chapterNumber > 0) {
-    chapterLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(chapterNumber);
-    if (chapterCount > 0) {
-      chapterLine += "/" + std::to_string(chapterCount);
-    }
-    if (!chapterTitle.empty()) {
-      chapterLine += ": " + chapterTitle;
-    }
-  } else if (!chapterTitle.empty()) {
-    chapterLine = chapterTitle;
-  }
-
-  if (!chapterLine.empty()) {
+  // Line 2: chapter title only (skip when the section has no TOC entry).
+  if (!chapterTitle.empty()) {
     const std::string truncatedChapter =
-        renderer.truncatedText(UI_10_FONT_ID, chapterLine.c_str(), contentWidth - 40);
+        renderer.truncatedText(UI_10_FONT_ID, chapterTitle.c_str(), contentWidth - 40);
     renderer.drawCenteredText(UI_10_FONT_ID, 43 + contentY, truncatedChapter.c_str());
   }
 
-  std::string progressLine;
-  if (totalPages > 0) {
-    progressLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(currentPage) + "/" +
-                   std::to_string(totalPages) + std::string(tr(STR_PAGES_SEPARATOR));
+  // Line 3: "Chapter X/Y  Pages A/B  |  Z%" with each segment conditional.
+  char metaBuf[128];
+  char* p = metaBuf;
+  char* const end = metaBuf + sizeof(metaBuf);
+  if (chapterNumber > 0) {
+    if (chapterCount > 0) {
+      p += snprintf(p, end - p, "%s%d/%d  ", tr(STR_CHAPTER_LABEL), chapterNumber, chapterCount);
+    } else {
+      p += snprintf(p, end - p, "%s%d  ", tr(STR_CHAPTER_LABEL), chapterNumber);
+    }
   }
-  progressLine += std::string(tr(STR_BOOK_PREFIX)) + std::to_string(bookProgressPercent) + "%";
-  renderer.drawCenteredText(UI_10_FONT_ID, 62 + contentY, progressLine.c_str());
+  if (totalPages > 0) {
+    p += snprintf(p, end - p, "%s%d/%d  |  ", tr(STR_PAGES_LABEL), currentPage, totalPages);
+  }
+  snprintf(p, end - p, "%d%%", bookProgressPercent);
+  renderer.drawCenteredText(UI_10_FONT_ID, 62 + contentY, metaBuf);
 
   // Menu Items
   const int startY = 90 + contentY;
