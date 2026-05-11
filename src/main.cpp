@@ -14,6 +14,7 @@
 #include <Logging.h>
 #include <SPI.h>
 #include <builtinFonts/all.h>
+#include <esp_task_wdt.h>
 
 #include <cstring>
 
@@ -199,6 +200,11 @@ void setupDisplayAndFonts() {
 
 void setup() {
   HalSystem::begin();
+  // Don't subscribe loopTask to the task WDT: legitimately long operations
+  // (BT auto-reconnect, large SD writes) routinely block loop() for >5 s.
+  // The scattered esp_task_wdt_reset() calls in network handlers become harmless
+  // no-ops; just silence the IDF "task not found" error spam they produce.
+  esp_log_level_set("task_wdt", ESP_LOG_NONE);
   gpio.begin();
   powerManager.begin();
   halTiltSensor.begin();
