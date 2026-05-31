@@ -336,6 +336,8 @@ void HalGPIO::clearVirtualButtons() {
   }
 }
 
+unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getPowerButtonHeldTime(); }
+
 void HalGPIO::startDeepSleep() {
   // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
   while (inputMgr.isPressed(BTN_POWER)) {
@@ -376,16 +378,8 @@ void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPre
     do {
       delay(10);
       inputMgr.update();
-      
-      // Early bail-out: if the button is released before the duration is met, sleep immediately
-      if (!inputMgr.isPressed(BTN_POWER)) {
-        startDeepSleep();
-        return;
-      }
-    } while (inputMgr.getHeldTime() < calibratedDuration && millis() - start < 2000);
-    
-    // Check one final time in case the loop timed out
-    if (inputMgr.getHeldTime() < calibratedDuration) {
+    } while (inputMgr.isPressed(BTN_POWER) && inputMgr.getPowerButtonHeldTime() < calibratedDuration);
+    if (inputMgr.getPowerButtonHeldTime() < calibratedDuration) {
       startDeepSleep();
     }
   } else {

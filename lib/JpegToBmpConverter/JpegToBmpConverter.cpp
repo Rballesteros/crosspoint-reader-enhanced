@@ -4,11 +4,11 @@
 #include <HalStorage.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <new>
 
 #include "BitmapHelpers.h"
 
@@ -167,6 +167,9 @@ constexpr size_t JPEG_DECODER_SIZE = 20 * 1024;
 constexpr size_t MIN_FREE_HEAP = JPEG_DECODER_SIZE + 32 * 1024;
 constexpr size_t BMP_CONVERT_SAFETY_MARGIN = 24 * 1024;
 
+// Pre-flight heap check: refuse the conversion if the working buffers would not fit, accounting for
+// both total free heap (with a safety margin) and the largest contiguous block. This avoids partially
+// allocating, then failing mid-decode on the fragmentation-prone ESP32-C3.
 bool hasHeapForBmpConvert(const size_t totalBytes, const size_t largestBlock, const char* label) {
   const size_t freeHeap = ESP.getFreeHeap();
   const size_t maxAlloc = ESP.getMaxAllocHeap();
@@ -181,7 +184,7 @@ bool hasHeapForBmpConvert(const size_t totalBytes, const size_t largestBlock, co
 
 // Static file pointer for JPEGDEC open callback.
 // Safe in single-threaded embedded context; never accessed concurrently.
-static FsFile* s_jpegFile = nullptr;
+static HalFile* s_jpegFile = nullptr;
 
 void* bmpJpegOpen(const char* /*filename*/, int32_t* size) {
   if (!s_jpegFile || !*s_jpegFile) return nullptr;
@@ -195,7 +198,7 @@ void bmpJpegClose(void* /*handle*/) {
 }
 
 int32_t bmpJpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  auto* f = reinterpret_cast<FsFile*>(pFile->fHandle);
+  auto* f = reinterpret_cast<HalFile*>(pFile->fHandle);
   if (!f) return 0;
   int32_t n = f->read(pBuf, len);
   if (n < 0) n = 0;
@@ -204,7 +207,7 @@ int32_t bmpJpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
 }
 
 int32_t bmpJpegSeek(JPEGFILE* pFile, int32_t pos) {
-  auto* f = reinterpret_cast<FsFile*>(pFile->fHandle);
+  auto* f = reinterpret_cast<HalFile*>(pFile->fHandle);
   if (!f || !f->seek(pos)) return -1;
   pFile->iPos = pos;
   return pos;
@@ -225,15 +228,15 @@ struct BmpConvertCtx {
 
   // Accumulates one MCU row (up to MAX_MCU_HEIGHT source rows × srcWidth pixels)
   // Filled column-by-column as JPEGDEC callbacks arrive for the same MCU row
-  std::vector<uint8_t> mcuBuf;
+  std::unique_ptr<uint8_t[]> mcuBuf;
 
   // Y-axis area averaging accumulators (needsScaling only)
   int currentOutY;
   uint32_t nextOutY_srcStart;  // 16.16 fixed-point boundary for the next output row
-  std::vector<uint32_t> rowAccum;
-  std::vector<uint32_t> rowCount;
+  std::unique_ptr<uint32_t[]> rowAccum;
+  std::unique_ptr<uint32_t[]> rowCount;
 
-  std::vector<uint8_t> bmpRow;
+  std::unique_ptr<uint8_t[]> bmpRow;
 
   std::unique_ptr<AtkinsonDitherer> atkinsonDitherer;
   std::unique_ptr<FloydSteinbergDitherer> fsDitherer;
@@ -244,7 +247,7 @@ struct BmpConvertCtx {
 
 // Write a fully-assembled output row (grayscale bytes, length outWidth) to BMP
 static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) {
-  std::fill(ctx->bmpRow.begin(), ctx->bmpRow.end(), 0);
+  memset(ctx->bmpRow.get(), 0, ctx->bytesPerRow);
 
   if (USE_8BIT_OUTPUT && !ctx->oneBit) {
     for (int x = 0; x < ctx->outWidth; x++) {
@@ -276,12 +279,12 @@ static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) 
       ctx->fsDitherer->nextRow();
   }
 
-  ctx->bmpOut->write(ctx->bmpRow.data(), ctx->bytesPerRow);
+  ctx->bmpOut->write(ctx->bmpRow.get(), ctx->bytesPerRow);
 }
 
 // Flush one scaled output row from Y-axis accumulators and advance currentOutY
 static void flushScaledRow(BmpConvertCtx* ctx) {
-  std::fill(ctx->bmpRow.begin(), ctx->bmpRow.end(), 0);
+  memset(ctx->bmpRow.get(), 0, ctx->bytesPerRow);
 
   if (USE_8BIT_OUTPUT && !ctx->oneBit) {
     for (int x = 0; x < ctx->outWidth; x++) {
@@ -315,7 +318,7 @@ static void flushScaledRow(BmpConvertCtx* ctx) {
       ctx->fsDitherer->nextRow();
   }
 
-  ctx->bmpOut->write(ctx->bmpRow.data(), ctx->bytesPerRow);
+  ctx->bmpOut->write(ctx->bmpRow.get(), ctx->bytesPerRow);
   ctx->currentOutY++;
 }
 
@@ -334,11 +337,19 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
   const int blockX = pDraw->x;
   const int blockY = pDraw->y;
 
+  // Guard against unexpected callback geometry so we never index past row buffers.
+  if (blockX < 0 || blockY < 0 || blockX >= ctx->srcWidth || blockY >= ctx->srcHeight) {
+    LOG_ERR("JPG", "Unexpected JPEG block origin (%d,%d) for decode grid %dx%d", blockX, blockY, ctx->srcWidth,
+            ctx->srcHeight);
+    ctx->error = true;
+    return 0;
+  }
+
   // Copy block pixels into MCU row buffer
   for (int r = 0; r < blockH && r < MAX_MCU_HEIGHT; r++) {
     const int copyW = (blockX + validW <= ctx->srcWidth) ? validW : (ctx->srcWidth - blockX);
     if (copyW <= 0) continue;
-    memcpy(ctx->mcuBuf.data() + r * ctx->srcWidth + blockX, pixels + r * stride, copyW);
+    memcpy(ctx->mcuBuf.get() + r * ctx->srcWidth + blockX, pixels + r * stride, copyW);
   }
 
   // Wait for the last MCU column before processing any rows
@@ -348,7 +359,7 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
   const int endRow = blockY + blockH;
 
   for (int y = blockY; y < endRow && y < ctx->srcHeight; y++) {
-    const uint8_t* srcRow = ctx->mcuBuf.data() + (y - blockY) * ctx->srcWidth;
+    const uint8_t* srcRow = ctx->mcuBuf.get() + (y - blockY) * ctx->srcWidth;
 
     if (!ctx->needsScaling) {
       // 1:1 — outWidth == srcWidth, write directly
@@ -378,8 +389,8 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
         flushScaledRow(ctx);
         ctx->nextOutY_srcStart = static_cast<uint32_t>(ctx->currentOutY + 1) * ctx->scaleY_fp;
         if (srcY_fp >= ctx->nextOutY_srcStart) continue;
-        std::fill(ctx->rowAccum.begin(), ctx->rowAccum.end(), 0);
-        std::fill(ctx->rowCount.begin(), ctx->rowCount.end(), 0);
+        memset(ctx->rowAccum.get(), 0, ctx->outWidth * sizeof(uint32_t));
+        memset(ctx->rowCount.get(), 0, ctx->outWidth * sizeof(uint32_t));
       }
     }
   }
@@ -390,8 +401,8 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
 }  // namespace
 
 // Internal implementation with configurable target size and bit depth
-bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bmpOut, int targetWidth, int targetHeight,
-                                                     bool oneBit, bool crop) {
+bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& bmpOut, int targetWidth,
+                                                     int targetHeight, bool oneBit, bool crop) {
   LOG_DBG("JPG", "Converting JPEG to %s BMP (target: %dx%d)", oneBit ? "1-bit" : "2-bit", targetWidth, targetHeight);
 
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
@@ -401,23 +412,32 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
 
   s_jpegFile = &jpegFile;
 
-  JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
+  const auto jpeg = makeUniqueNoThrow<JPEGDEC>();
   if (!jpeg) {
-    LOG_ERR("JPG", "Failed to allocate JPEG decoder");
+    LOG_ERR("JPG", "OOM: JPEG decoder");
     return false;
   }
 
   int rc = jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, bmpDrawCallback);
   if (rc != 1) {
     LOG_ERR("JPG", "JPEG open failed (err=%d)", jpeg->getLastError());
-    delete jpeg;
     return false;
   }
 
+  const ScopedCleanup cleanup{[&jpeg]() { jpeg->close(); }};
+
   const int srcWidth = jpeg->getWidth();
   const int srcHeight = jpeg->getHeight();
+  const bool progressiveDecode = (jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE);
+  // JPEGDEC forces progressive streams to JPEG_SCALE_EIGHTH in DecodeJPEG,
+  // so callback coordinates and MCU buffering must use the reduced decode grid.
+  const int decodedSrcWidth = progressiveDecode ? ((srcWidth + 7) >> 3) : srcWidth;
+  const int decodedSrcHeight = progressiveDecode ? ((srcHeight + 7) >> 3) : srcHeight;
 
   LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
+  if (progressiveDecode) {
+    LOG_DBG("JPG", "Progressive JPEG decode uses 1/8 source: %dx%d", decodedSrcWidth, decodedSrcHeight);
+  }
 
   constexpr int MAX_IMAGE_WIDTH = 2048;
   constexpr int MAX_IMAGE_HEIGHT = 3072;
@@ -425,14 +445,21 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_IMAGE_WIDTH || srcHeight > MAX_IMAGE_HEIGHT) {
     LOG_DBG("JPG", "Image too large or invalid (%dx%d), max supported: %dx%d", srcWidth, srcHeight, MAX_IMAGE_WIDTH,
             MAX_IMAGE_HEIGHT);
-    jpeg->close();
-    delete jpeg;
     return false;
   }
 
   // Calculate output dimensions (pre-scale to fit display exactly)
   int outWidth = srcWidth;
   int outHeight = srcHeight;
+  if (targetWidth <= 0 || targetHeight <= 0) {
+    // Without an explicit target, keep decoder-native dimensions.
+    outWidth = decodedSrcWidth;
+    outHeight = decodedSrcHeight;
+  }
+
+  const int scaleSrcWidth = decodedSrcWidth;
+  const int scaleSrcHeight = decodedSrcHeight;
+
   uint32_t scaleX_fp = 65536;  // 1.0 in 16.16 fixed point
   uint32_t scaleY_fp = 65536;
   bool needsScaling = false;
@@ -452,12 +479,14 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
     if (outWidth < 1) outWidth = 1;
     if (outHeight < 1) outHeight = 1;
 
-    scaleX_fp = (static_cast<uint32_t>(srcWidth) << 16) / outWidth;
-    scaleY_fp = (static_cast<uint32_t>(srcHeight) << 16) / outHeight;
-    needsScaling = true;
+    LOG_DBG("JPG", "Scaling source %dx%d (decode grid %dx%d) -> %dx%d (target %dx%d)", srcWidth, srcHeight,
+            scaleSrcWidth, scaleSrcHeight, outWidth, outHeight, targetWidth, targetHeight);
+  }
 
-    LOG_DBG("JPG", "Scaling %dx%d -> %dx%d (target %dx%d)", srcWidth, srcHeight, outWidth, outHeight, targetWidth,
-            targetHeight);
+  if (scaleSrcWidth != outWidth || scaleSrcHeight != outHeight) {
+    scaleX_fp = (static_cast<uint32_t>(scaleSrcWidth) << 16) / outWidth;
+    scaleY_fp = (static_cast<uint32_t>(scaleSrcHeight) << 16) / outHeight;
+    needsScaling = true;
   }
 
   // Write BMP header with output dimensions
@@ -475,8 +504,8 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
 
   BmpConvertCtx ctx = {};
   ctx.bmpOut = &bmpOut;
-  ctx.srcWidth = srcWidth;
-  ctx.srcHeight = srcHeight;
+  ctx.srcWidth = scaleSrcWidth;
+  ctx.srcHeight = scaleSrcHeight;
   ctx.outWidth = outWidth;
   ctx.outHeight = outHeight;
   ctx.oneBit = oneBit;
@@ -486,7 +515,9 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   ctx.scaleY_fp = scaleY_fp;
   ctx.error = false;
 
-  const size_t mcuBytes = static_cast<size_t>(MAX_MCU_HEIGHT) * static_cast<size_t>(srcWidth);
+  // Pre-flight heap check before allocating any working buffers, so we fail cleanly up front
+  // (ScopedCleanup closes the decoder) instead of partway through on the fragmentation-prone C3.
+  const size_t mcuBytes = static_cast<size_t>(MAX_MCU_HEIGHT) * static_cast<size_t>(ctx.srcWidth);
   const size_t bmpRowBytes = static_cast<size_t>(bytesPerRow);
   const size_t rowAccumBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint32_t) : 0;
   const size_t rowCountBytes = needsScaling ? static_cast<size_t>(outWidth) * sizeof(uint32_t) : 0;
@@ -503,49 +534,50 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   largestBlock = std::max(largestBlock, ditherBytes / 2 + sizeof(int16_t) * 4);
   const size_t totalWorkingBytes = mcuBytes + bmpRowBytes + rowAccumBytes + rowCountBytes + ditherBytes;
   if (!hasHeapForBmpConvert(totalWorkingBytes, largestBlock, "JPEG BMP buffers")) {
-    jpeg->close();
-    delete jpeg;
-    s_jpegFile = nullptr;
     return false;
   }
 
-  // MCU row buffer: MAX_MCU_HEIGHT rows × srcWidth columns of grayscale
-  ctx.mcuBuf.assign(mcuBytes, 0);
+  // MCU row buffer: MAX_MCU_HEIGHT rows × decoded srcWidth columns of grayscale
+  ctx.mcuBuf = makeUniqueNoThrow<uint8_t[]>(MAX_MCU_HEIGHT * ctx.srcWidth);
+  if (!ctx.mcuBuf) {
+    LOG_ERR("JPG", "OOM: MCU buffer (%d bytes)", MAX_MCU_HEIGHT * ctx.srcWidth);
+    return false;
+  }
+  memset(ctx.mcuBuf.get(), 0, MAX_MCU_HEIGHT * ctx.srcWidth);
 
-  ctx.bmpRow.assign(bytesPerRow, 0);
+  ctx.bmpRow = makeUniqueNoThrow<uint8_t[]>(bytesPerRow);
+  if (!ctx.bmpRow) {
+    LOG_ERR("JPG", "OOM: BMP row buffer");
+    return false;
+  }
 
   if (needsScaling) {
-    ctx.rowAccum.assign(outWidth, 0);
-    ctx.rowCount.assign(outWidth, 0);
+    ctx.rowAccum = makeUniqueNoThrow<uint32_t[]>(outWidth);
+    ctx.rowCount = makeUniqueNoThrow<uint32_t[]>(outWidth);
+    if (!ctx.rowAccum || !ctx.rowCount) {
+      LOG_ERR("JPG", "OOM: scaling buffers");
+      return false;
+    }
     ctx.nextOutY_srcStart = scaleY_fp;
   }
 
   if (oneBit) {
-    ctx.atkinson1BitDitherer.reset(new (std::nothrow) Atkinson1BitDitherer(outWidth));
+    ctx.atkinson1BitDitherer = makeUniqueNoThrow<Atkinson1BitDitherer>(outWidth);
     if (!ctx.atkinson1BitDitherer) {
-      LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate 1-bit ditherer");
-      jpeg->close();
-      delete jpeg;
-      s_jpegFile = nullptr;
+      LOG_ERR("JPG", "OOM: Atkinson1BitDitherer");
       return false;
     }
   } else if (!USE_8BIT_OUTPUT) {
     if (USE_ATKINSON) {
-      ctx.atkinsonDitherer.reset(new (std::nothrow) AtkinsonDitherer(outWidth));
+      ctx.atkinsonDitherer = makeUniqueNoThrow<AtkinsonDitherer>(outWidth);
       if (!ctx.atkinsonDitherer) {
-        LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate Atkinson ditherer");
-        jpeg->close();
-        delete jpeg;
-        s_jpegFile = nullptr;
+        LOG_ERR("JPG", "OOM: AtkinsonDitherer");
         return false;
       }
     } else if (USE_FLOYD_STEINBERG) {
-      ctx.fsDitherer.reset(new (std::nothrow) FloydSteinbergDitherer(outWidth));
+      ctx.fsDitherer = makeUniqueNoThrow<FloydSteinbergDitherer>(outWidth);
       if (!ctx.fsDitherer) {
-        LOG_DBG("JPG", "Skipping JPEG BMP conversion: failed to allocate Floyd-Steinberg ditherer");
-        jpeg->close();
-        delete jpeg;
-        s_jpegFile = nullptr;
+        LOG_ERR("JPG", "OOM: FloydSteinbergDitherer");
         return false;
       }
     }
@@ -555,13 +587,9 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
   jpeg->setUserPointer(&ctx);
 
   rc = jpeg->decode(0, 0, 0);
-  const int decodeError = jpeg->getLastError();
-  jpeg->close();
-  delete jpeg;
-  s_jpegFile = nullptr;
 
   if (rc != 1 || ctx.error) {
-    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, decodeError);
+    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, jpeg->getLastError());
     return false;
   }
 
@@ -570,7 +598,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
 }
 
 // Core function: Convert JPEG file to 2-bit BMP (uses default target size)
-bool JpegToBmpConverter::jpegFileToBmpStream(FsFile& jpegFile, Print& bmpOut, bool crop) {
+bool JpegToBmpConverter::jpegFileToBmpStream(HalFile& jpegFile, Print& bmpOut, bool crop) {
   // Use runtime display dimensions (swapped for portrait cover sizing)
   const int targetWidth = display.getDisplayHeight();
   const int targetHeight = display.getDisplayWidth();
@@ -578,13 +606,13 @@ bool JpegToBmpConverter::jpegFileToBmpStream(FsFile& jpegFile, Print& bmpOut, bo
 }
 
 // Convert with custom target size (for thumbnails, 2-bit)
-bool JpegToBmpConverter::jpegFileToBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth,
+bool JpegToBmpConverter::jpegFileToBmpStreamWithSize(HalFile& jpegFile, Print& bmpOut, int targetMaxWidth,
                                                      int targetMaxHeight) {
   return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, false);
 }
 
 // Convert to 1-bit BMP (black and white only, no grays) for fast home screen rendering
-bool JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth,
+bool JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(HalFile& jpegFile, Print& bmpOut, int targetMaxWidth,
                                                          int targetMaxHeight) {
   return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true);
 }

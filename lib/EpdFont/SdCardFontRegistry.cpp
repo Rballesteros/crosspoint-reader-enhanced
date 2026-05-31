@@ -4,8 +4,6 @@
 #include <Logging.h>
 
 #include <algorithm>
-#include <climits>
-#include <cstdlib>
 #include <cstring>
 
 // --- SdCardFontFamilyInfo helpers ---
@@ -38,21 +36,6 @@ std::vector<uint8_t> SdCardFontFamilyInfo::availableSizes() const {
   }
   std::sort(sizes.begin(), sizes.end());
   return sizes;
-}
-
-const SdCardFontFileInfo* SdCardFontFamilyInfo::pickClosestSize(uint8_t targetPtSize) const {
-  const SdCardFontFileInfo* selected = nullptr;
-  int bestDiff = INT_MAX;
-  for (const auto& f : files) {
-    int diff = std::abs(static_cast<int>(f.pointSize) - static_cast<int>(targetPtSize));
-    // Strict < ensures the first scan wins on ties; then tie-break by smaller
-    // pointSize to make the choice independent of filesystem enumeration order.
-    if (diff < bestDiff || (diff == bestDiff && selected && f.pointSize < selected->pointSize)) {
-      bestDiff = diff;
-      selected = &f;
-    }
-  }
-  return selected;
 }
 
 // --- SdCardFontRegistry ---
@@ -94,12 +77,12 @@ bool SdCardFontRegistry::parseFilename(const char* filename, uint8_t& size, uint
 }
 
 void SdCardFontRegistry::scanDirectory(const char* dirPath, SdCardFontFamilyInfo& family) {
-  FsFile dir = Storage.open(dirPath);
+  HalFile dir = Storage.open(dirPath);
   if (!dir || !dir.isDirectory()) return;
 
   char nameBuffer[128];
   while (true) {
-    FsFile entry = dir.openNextFile();
+    HalFile entry = dir.openNextFile();
     if (!entry) break;
     if (entry.isDirectory()) {
       entry.close();
@@ -143,7 +126,7 @@ void SdCardFontRegistry::scanDirectory(const char* dirPath, SdCardFontFamilyInfo
 // Skips families whose names already exist in `out` (de-duplicates between
 // the hidden and visible roots — first scan wins).
 void SdCardFontRegistry::scanRoot(const char* rootPath, std::vector<SdCardFontFamilyInfo>& out) {
-  FsFile root = Storage.open(rootPath);
+  HalFile root = Storage.open(rootPath);
   if (!root) {
     LOG_DBG("SDREG", "Fonts directory not found: %s", rootPath);
     return;
@@ -155,7 +138,7 @@ void SdCardFontRegistry::scanRoot(const char* rootPath, std::vector<SdCardFontFa
 
   char nameBuffer[128];
   while (true) {
-    FsFile entry = root.openNextFile();
+    HalFile entry = root.openNextFile();
     if (!entry) break;
     if (entry.isDirectory()) {
       entry.getName(nameBuffer, sizeof(nameBuffer));

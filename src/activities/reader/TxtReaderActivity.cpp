@@ -227,6 +227,17 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
   }
   buffer[chunkSize] = '\0';
 
+  // Prime the SD card font's advance table with this chunk's codepoints.
+  // Without this, every getTextAdvanceX() call in the wrap loop below triggers
+  // on-demand glyph loads through the 8-slot overflow ring buffer, which
+  // thrashes for any text with more than 8 unique chars (i.e. all English),
+  // floods the heap with short-lived bitmap allocations, and eventually
+  // corrupts FreeRTOS state. The advance table persists across calls per
+  // font, so the cost amortizes to ~ASCII-size after the first chunk.
+  if (renderer.isSdCardFont(cachedFontId)) {
+    renderer.ensureSdCardFontReady(cachedFontId, reinterpret_cast<const char*>(buffer.get()), /*styleMask=*/0x01);
+  }
+
   // Parse lines from buffer
   size_t pos = 0;
 
@@ -266,7 +277,7 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
         break;
       }
 
-      int lineWidth = renderer.getTextWidth(cachedFontId, line.c_str());
+      int lineWidth = renderer.getTextAdvanceX(cachedFontId, line.c_str(), EpdFontFamily::REGULAR);
 
       if (lineWidth <= viewportWidth) {
         outLines.push_back(line);
@@ -505,7 +516,7 @@ void TxtReaderActivity::renderStatusBar() const {
 }
 
 void TxtReaderActivity::saveProgress() const {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForWrite("TRS", txt->getCachePath() + "/progress.bin", f)) {
     uint8_t data[4];
     data[0] = currentPage & 0xFF;
@@ -517,7 +528,7 @@ void TxtReaderActivity::saveProgress() const {
 }
 
 void TxtReaderActivity::loadProgress() {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForRead("TRS", txt->getCachePath() + "/progress.bin", f)) {
     uint8_t data[4];
     if (f.read(data, 4) == 4) {
@@ -547,7 +558,7 @@ bool TxtReaderActivity::loadPageIndexCache() {
   // - N * uint32_t: page offsets
 
   std::string cachePath = txt->getCachePath() + "/index.bin";
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForRead("TRS", cachePath, f)) {
     LOG_DBG("TRS", "No page index cache found");
     return false;
@@ -630,7 +641,7 @@ bool TxtReaderActivity::loadPageIndexCache() {
 
 void TxtReaderActivity::savePageIndexCache() const {
   std::string cachePath = txt->getCachePath() + "/index.bin";
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForWrite("TRS", cachePath, f)) {
     LOG_ERR("TRS", "Failed to save page index cache");
     return;

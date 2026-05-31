@@ -8,14 +8,20 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
+#include <JsonSettingsIO.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <esp_system.h>
 
+#include <algorithm>
+#include <functional>
 #include <iterator>
 #include <limits>
 
+#include "BookmarkEntry.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "EpubReaderBookmarksActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnotesActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
@@ -29,6 +35,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/BookmarkUtil.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -53,6 +60,68 @@ int clampPercent(int percent) {
   return percent;
 }
 
+// SD card folder finished books are moved into. Single source of truth for the path.
+// constexpr ⇒ lives in flash .rodata, no DRAM cost.
+constexpr char READ_FOLDER[] = "/read";
+
+// True if path is inside READ_FOLDER (starts with "<READ_FOLDER>/"). Non-allocating so
+// it is cheap to call from loop(), and avoids reintroducing a separate "/Read/" literal.
+bool isInReadFolder(const std::string& path) {
+  constexpr size_t n = sizeof(READ_FOLDER) - 1;  // length of "/Read" (excludes NUL)
+  return path.size() > n && path.compare(0, n, READ_FOLDER) == 0 && path[n] == '/';
+}
+
+// Pick a non-colliding destination path inside /Read/ for a finished book.
+// Mirrors the suffixing scheme used elsewhere: "name.epub" -> "name (2).epub", etc.
+std::string buildReadFolderDestination(const std::string& srcPath) {
+  const size_t lastSlash = srcPath.rfind('/');
+  const std::string filename = (lastSlash != std::string::npos) ? srcPath.substr(lastSlash + 1) : srcPath;
+
+  Storage.mkdir(READ_FOLDER);
+  std::string dstPath = std::string(READ_FOLDER) + "/" + filename;
+  if (!Storage.exists(dstPath.c_str())) {
+    return dstPath;
+  }
+
+  const size_t dotPos = filename.rfind('.');
+  const std::string base = (dotPos != std::string::npos) ? filename.substr(0, dotPos) : filename;
+  const std::string ext = (dotPos != std::string::npos) ? filename.substr(dotPos) : "";
+  int suffix = 2;
+  do {
+    dstPath = std::string(READ_FOLDER) + "/" + base + " (" + std::to_string(suffix) + ")" + ext;
+    suffix++;
+  } while (Storage.exists(dstPath.c_str()) && suffix < 100);
+  return dstPath;
+}
+
+// Relocate a finished book and its cache dir into /read/, keep it in recents by
+// repointing its entry to the new path, and repoint the resume pointer too.
+// On rename failure: LOG_ERR and leave everything in place (no UI alert subsystem here).
+void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string& dstPath,
+                                  const std::string& oldCachePath) {
+  LOG_INF("ERS", "Moving finished epub: %s -> %s", srcPath.c_str(), dstPath.c_str());
+  if (!Storage.rename(srcPath.c_str(), dstPath.c_str())) {
+    LOG_ERR("ERS", "Failed to move finished book to '/Read' folder");
+    return;
+  }
+
+  // Cache dir is keyed by hash of the epub path (see Epub ctor), so it must be re-keyed.
+  const std::string newCachePath = "/.crosspoint/epub_" + std::to_string(std::hash<std::string>{}(dstPath));
+  if (!oldCachePath.empty() && Storage.exists(oldCachePath.c_str())) {
+    if (!Storage.rename(oldCachePath.c_str(), newCachePath.c_str())) {
+      LOG_ERR("ERS", "Failed to rename cache dir %s -> %s (non-fatal)", oldCachePath.c_str(), newCachePath.c_str());
+    }
+  }
+
+  // Keep the book in recents (crossink behavior): repoint the entry to its new
+  // location instead of dropping it. updatePath persists on success.
+  RECENT_BOOKS.updatePath(srcPath, dstPath, oldCachePath, newCachePath);
+  if (APP_STATE.openEpubPath == srcPath) {
+    APP_STATE.openEpubPath = dstPath;
+    APP_STATE.saveToFile();
+  }
+}
+
 }  // namespace
 
 void EpubReaderActivity::onEnter() {
@@ -68,7 +137,7 @@ void EpubReaderActivity::onEnter() {
 
   epub->setupCacheDir();
 
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
     uint8_t data[6];
     int dataSize = f.read(data, 6);
@@ -109,7 +178,15 @@ void EpubReaderActivity::onExit() {
   chapterSkipConsumedForHold = false;
   clearAaSettle();
   section.reset();
-  epub.reset();
+  if (pendingReadFolderMove && epub) {
+    const std::string srcPath = epub->getPath();
+    const std::string oldCachePath = epub->getCachePath();
+    const std::string dstPath = buildReadFolderDestination(srcPath);
+    epub.reset();  // release the Epub (and any open handles) before renaming on the SD card
+    moveFinishedBookToReadFolder(srcPath, dstPath, oldCachePath);
+  } else {
+    epub.reset();
+  }
 }
 
 void EpubReaderActivity::onPause() {
@@ -130,24 +207,33 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // Edge-triggered settle for deferred AA: once input has been idle long enough
-  // and the render task is free, ask render() to lay down the grayscale pass.
-  if (aaSettlePending.load() && !settleAlreadyRequested &&
-      (millis() - lastPageTurnTime) > ReaderUtils::SETTLE_THRESHOLD_MS && !RenderLock::peek()) {
-    settleAlreadyRequested = true;
-    requestUpdate();
+  // End-of-Book screen reached (currentSpineIndex == spine count) means the book is
+  // finished. Two independent finished-book features key off this same condition.
+  const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
+
+  // Drop this book from the Recent Books list; if the reader then pages back into the book,
+  // re-add it. So removal only sticks if the reader leaves while still on the End-of-Book
+  // screen. Acts only on the transition (guarded by recentsEntryRemoved) — no per-frame writes.
+  if (SETTINGS.removeReadBooksFromRecents) {
+    if (atEndOfBook && !recentsEntryRemoved) {
+      // Only treat the book as "removed by us" if it was actually in the list, so the
+      // re-add branch below doesn't insert a book the feature never removed.
+      recentsEntryRemoved = RECENT_BOOKS.removeByPath(epub->getPath());
+    } else if (!atEndOfBook && recentsEntryRemoved) {
+      // Re-add (goes to front of the list via addBook — accepted ordering side effect).
+      RECENT_BOOKS.addBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), epub->getThumbBmpPath());
+      recentsEntryRemoved = false;
+    }
   }
 
-  // Idle next-page prefetch: deserialize currentPage+1 from the chapter cache
-  // while the user is settled on the current page. Skipped if a settle render
-  // is pending — that gates ahead. RenderLock serializes the SD read against
-  // the render task; peek() is the cheap hint to skip if render is currently
-  // busy (the lock would block otherwise).
-  if (section && !aaSettlePending.load() && (millis() - lastPageTurnTime) > PREFETCH_IDLE_MS && !RenderLock::peek()) {
-    RenderLock lock(*this);
-    if (section) {
-      section->prefetchNextPage();
-    }
+  // Arm the move here so ANY exit path (Back, Home, file browser) relocates the book into
+  // /Read/ in onExit(); paging back off the end screen disarms it (book not actually
+  // finished). If removeReadBooksFromRecents also fired, RecentBooksStore::updatePath in the
+  // move path becomes a safe no-op since the entry was already removed.
+  if (atEndOfBook) {
+    pendingReadFolderMove = SETTINGS.moveFinishedToReadFolder && !isInReadFolder(epub->getPath());
+  } else {
+    pendingReadFolderMove = false;
   }
 
   if (automaticPageTurnActive) {
@@ -176,6 +262,14 @@ void EpubReaderActivity::loop() {
     }
   }
 
+  // Clear the transient "bookmark added" message after its timeout.
+  if (showBookmarkMessage && (millis() - bookmarkMessageTime) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
+    showBookmarkMessage = false;
+    requestUpdate();
+  }
+
+  // Skip button processing for one cycle after returning from a modal (menu/Bluetooth) screen,
+  // until Confirm/Back are fully released, so the triggering press doesn't leak into the reader.
   if (skipNextButtonCheck) {
     const bool confirmCleared = !mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
                                 !mappedInput.wasReleased(MappedInputManager::Button::Confirm);
@@ -187,51 +281,68 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // Enter reader menu activity.
+  // Enter reader menu activity (BLE-aware trigger). A Confirm release that follows a bookmark
+  // hold is swallowed by ignoreNextConfirmRelease so the menu doesn't also open.
   if (ReaderUtils::actionTriggered(mappedInput, MappedInputManager::Button::Confirm)) {
-    const int currentPage = section ? section->currentPage + 1 : 0;
-    const int totalPages = section ? section->pageCount : 0;
-    float bookProgress = 0.0f;
-    if (epub->getBookSize() > 0 && section && section->pageCount > 0) {
-      const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
-      bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
-    }
-    const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-    std::string chapterTitle;
-    int chapterNumber = 0;
-    int chapterCount = 0;
-    const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
-    if (tocIndex >= 0) {
-      const auto tocItem = epub->getTocItem(tocIndex);
-      chapterTitle = tocItem.title.empty() ? tr(STR_UNNAMED) : tocItem.title;
-      chapterNumber = tocIndex + 1;
-      chapterCount = epub->getTocItemsCount();
+    if (ignoreNextConfirmRelease) {
+      ignoreNextConfirmRelease = false;
     } else {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%s%d", tr(STR_SECTION_PREFIX), currentSpineIndex + 1);
-      chapterTitle = buf;
-      chapterNumber = currentSpineIndex + 1;
-      chapterCount = epub->getSpineItemsCount();
-    }
-    startActivityForResult(
-        std::make_unique<EpubReaderMenuActivity>(renderer, mappedInput, epub->getTitle(), chapterTitle, chapterNumber,
-                                                 chapterCount, currentPage, totalPages, bookProgressPercent,
-                                                 SETTINGS.orientation, !currentPageFootnotes.empty()),
-        [this](const ActivityResult& result) {
-          skipNextButtonCheck = true;
-          // The display currently contains the reader menu (or Bluetooth screen),
-          // not the book page. Force one stronger refresh when returning so the
-          // next book render re-establishes a clean differential baseline.
-          pagesUntilFullRefresh = 1;
+      const int currentPage = section ? section->currentPage + 1 : 0;
+      const int totalPages = section ? section->pageCount : 0;
+      float bookProgress = 0.0f;
+      if (epub->getBookSize() > 0 && section && section->pageCount > 0) {
+        const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+        bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
+      }
+      const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+      std::string chapterTitle;
+      int chapterNumber = 0;
+      int chapterCount = 0;
+      const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+      if (tocIndex >= 0) {
+        const auto tocItem = epub->getTocItem(tocIndex);
+        chapterTitle = tocItem.title.empty() ? tr(STR_UNNAMED) : tocItem.title;
+        chapterNumber = tocIndex + 1;
+        chapterCount = epub->getTocItemsCount();
+      } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s%d", tr(STR_SECTION_PREFIX), currentSpineIndex + 1);
+        chapterTitle = buf;
+        chapterNumber = currentSpineIndex + 1;
+        chapterCount = epub->getSpineItemsCount();
+      }
+      startActivityForResult(
+          std::make_unique<EpubReaderMenuActivity>(renderer, mappedInput, epub->getTitle(), chapterTitle, chapterNumber,
+                                                   chapterCount, currentPage, totalPages, bookProgressPercent,
+                                                   SETTINGS.orientation, !currentPageFootnotes.empty()),
+          [this](const ActivityResult& result) {
+            skipNextButtonCheck = true;
+            // The display currently contains the reader menu (or Bluetooth screen),
+            // not the book page. Force one stronger refresh when returning so the
+            // next book render re-establishes a clean differential baseline.
+            pagesUntilFullRefresh = 1;
 
-          // Always apply orientation change even if the menu was cancelled
-          const auto& menu = std::get<MenuResult>(result.data);
-          applyOrientation(menu.orientation);
-          toggleAutoPageTurn(menu.pageTurnOption);
-          if (!result.isCancelled) {
-            onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
-          }
-        });
+            // Always apply orientation change even if the menu was cancelled
+            const auto& menu = std::get<MenuResult>(result.data);
+            applyOrientation(menu.orientation);
+            toggleAutoPageTurn(menu.pageTurnOption);
+            if (!result.isCancelled) {
+              onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
+            }
+          });
+    }
+  }
+
+  // Hold Confirm to drop a bookmark at the current page.
+  if (mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+      mappedInput.getHeldTime() >= ReaderUtils::BOOKMARK_HOLD_MS) {
+    if (!showBookmarkMessage) {
+      addBookmark();
+      showBookmarkMessage = true;
+      ignoreNextConfirmRelease = true;  // Prevent accidental menu open after adding bookmark
+      bookmarkMessageTime = millis();
+      requestUpdate();
+    }
   }
 
   if (ReaderUtils::preferPressForBleInput() && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
@@ -391,6 +502,18 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 }
 
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
+  auto progressChangeResultHandler = [this](const ActivityResult& result) {
+    if (!result.isCancelled) {
+      const auto& sync = std::get<ProgressChangeResult>(result.data);
+      if (currentSpineIndex != sync.spineIndex || (section && section->currentPage != sync.page)) {
+        RenderLock lock(*this);
+        currentSpineIndex = sync.spineIndex;
+        nextPageNumber = sync.page;
+        section.reset();
+      }
+    }
+  };
+
   switch (action) {
     case EpubReaderMenuActivity::MenuAction::SELECT_CHAPTER: {
       const int spineIdx = currentSpineIndex;
@@ -398,10 +521,18 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       startActivityForResult(
           std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineIdx),
           [this](const ActivityResult& result) {
-            if (!result.isCancelled && currentSpineIndex != std::get<ChapterResult>(result.data).spineIndex) {
+            if (!result.isCancelled) {
+              const auto& chapterResult = std::get<ChapterResult>(result.data);
               RenderLock lock(*this);
-              currentSpineIndex = std::get<ChapterResult>(result.data).spineIndex;
+
+              currentSpineIndex = chapterResult.spineIndex;
+
+              // If anchor is not empty, it will be used later to calculate the page number.
+              pendingAnchor = chapterResult.anchor;
+
+              // Otherwise page 0 will be used.
               nextPageNumber = 0;
+
               section.reset();
             }
           });
@@ -436,26 +567,11 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     }
     case EpubReaderMenuActivity::MenuAction::DISPLAY_QR: {
       if (section && section->currentPage >= 0 && section->currentPage < section->pageCount) {
-        auto p = section->loadPageFromSectionFile();
-        if (p) {
-          std::string fullText;
-          for (const auto& el : p->elements) {
-            if (el->getTag() == TAG_PageLine) {
-              const auto& line = static_cast<const PageLine&>(*el);
-              if (line.getBlock()) {
-                const auto& words = line.getBlock()->getWords();
-                for (const auto& w : words) {
-                  if (!fullText.empty()) fullText += " ";
-                  fullText += w;
-                }
-              }
-            }
-          }
-          if (!fullText.empty()) {
-            startActivityForResult(std::make_unique<QrDisplayActivity>(renderer, mappedInput, fullText),
-                                   [this](const ActivityResult& result) {});
-            break;
-          }
+        std::string fullText = section->getTextFromSectionFile();
+        if (!fullText.empty()) {
+          startActivityForResult(std::make_unique<QrDisplayActivity>(renderer, mappedInput, fullText),
+                                 [this](const ActivityResult& result) {});
+          break;
         }
       }
       // If no text or page loading failed, just close menu
@@ -510,12 +626,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         }
 
         // Pre-compute local KO position and chapter name while Epub is still in RAM.
-        CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPages};
-        if (paragraphIndex.has_value()) {
-          localPos.paragraphIndex = *paragraphIndex;
-          localPos.hasParagraphIndex = true;
-        }
-        KOReaderPosition localKoPos = ProgressMapper::toKOReader(epub, localPos);
+        CrossPointPosition localPos = getCurrentPosition();
+        SavedProgressPosition localKoPos = ProgressMapper::toSavedProgress(epub, localPos);
         const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
         std::string localChapterName = (tocIdx >= 0) ? epub->getTocItem(tocIdx).title : "";
         const std::string savedEpubPath = epub->getPath();
@@ -545,6 +657,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             renderer, mappedInput, savedEpubPath, currentSpineIndex, currentPage, totalPages, std::move(localKoPos),
             std::move(localChapterName), paragraphIndex));
       }
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::BOOKMARKS: {
+      startActivityForResult(
+          std::make_unique<EpubReaderBookmarksActivity>(renderer, mappedInput, epub, epub->getPath()),
+          progressChangeResultHandler);
       break;
     }
   }
@@ -872,6 +990,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     pendingScreenshot = false;
     ScreenshotUtil::takeScreenshot(renderer);
   }
+
+  if (showBookmarkMessage) {
+    GUI.drawPopup(renderer, tr(STR_BOOKMARK_ADDED));
+  }
 }
 
 void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
@@ -967,88 +1089,104 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
-  // Consume the burst flag set by pageTurn(). If the previous turn was recent,
-  // skip the grayscale pass and stash the page for a settle render once the
-  // user idles. The BW frame on screen is the final state until then.
-  const bool rapidBurst = currentTurnIsRapid;
-  currentTurnIsRapid = false;
-  const bool runAaNow = SETTINGS.textAntiAliasing && !rapidBurst;
+  // Tiled grayscale: render each plane band-by-band into a small scratch and
+  // stream straight to the controller, leaving the BW framebuffer intact so no
+  // full-frame storeBwBuffer is needed; controller RAM is re-synced from the
+  // live framebuffer afterward. The page is re-rendered ceil(H/STRIP_ROWS) times
+  // per plane, but renderCharImpl culls out-of-band glyphs before decode so the
+  // cost stays close to one render. Both text (drawPixel) and images
+  // (DirectPixelWriter) honor the active strip target.
+  if (SETTINGS.textAntiAliasing && renderer.supportsStripGrayscale()) {
+    constexpr int STRIP_ROWS = 80;
+    const int gh = renderer.getDisplayHeight();
+    const int gwBytes = renderer.getDisplayWidthBytes();
 
-  // Try to save the BW buffer for fast restore after the grayscale pass. This
-  // is purely a speed optimization — AA itself doesn't need it. If the alloc
-  // fails (e.g. BT is connected and heap is tight), proceed with AA anyway and
-  // re-render the page after grayscale via the fallback path below. Costs one
-  // extra page render (~100-300ms) but keeps AA enabled in low-heap conditions.
-  bool bwBufferStored = false;
-  if (runAaNow) {
-    bwBufferStored = renderer.storeBwBuffer();
-    if (!bwBufferStored) {
-      LOG_DBG("ERS", "BW buffer store failed; AA will use re-render fallback (free heap=%lu)",
-              esp_get_free_heap_size());
-    }
-  }
-  const auto tBwStore = millis();
-
-  // grayscale rendering
-  // TODO: Only do this if font supports it
-  if (runAaNow) {
-    renderer.clearScreen(0x00);
-    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-    renderer.copyGrayscaleLsbBuffers();
-    const auto tGrayLsb = millis();
-
-    // Render and copy to MSB buffer
-    renderer.clearScreen(0x00);
-    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-    renderer.copyGrayscaleMsbBuffers();
-    const auto tGrayMsb = millis();
-
-    // display grayscale part
-    renderer.displayGrayBuffer();
-    const auto tGrayDisplay = millis();
-    renderer.setRenderMode(GfxRenderer::BW);
-    fcm->logStats("gray");
-
-    // Restore the BW frame for the next differential refresh. If the temporary
-    // copy failed (e.g. BLE reduced available heap), rebuild the page into the
-    // framebuffer and sync RED RAM from that instead of leaving grayscale data
-    // behind for the next FAST_REFRESH.
-    if (bwBufferStored) {
-      renderer.restoreBwBuffer();
-      LOG_DBG("ERS", "AA fast path: restored BW buffer");
+    auto scratch = makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(gwBytes) * STRIP_ROWS);
+    if (!scratch) {
+      LOG_ERR("ERS", "OOM: grayscale strip scratch (%d bytes); skipping AA this page", gwBytes * STRIP_ROWS);
     } else {
-      renderer.clearScreen();
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-      renderStatusBar();
+      // Bands may be streamed in any order: X4 windows each via setRamArea, X3
+      // via PTL.
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+      for (int y = 0; y < gh; y += STRIP_ROWS) {
+        const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+        renderer.beginStripTarget(scratch.get(), y, rows);
+        renderer.clearScreen(0x00);
+        page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+        renderer.endStripTarget();
+        renderer.writeGrayscalePlaneStrip(true, scratch.get(), y, rows);
+      }
+      const auto tGrayLsb = millis();
+
+      // MSB plane.
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+      for (int y = 0; y < gh; y += STRIP_ROWS) {
+        const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+        renderer.beginStripTarget(scratch.get(), y, rows);
+        renderer.clearScreen(0x00);
+        page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+        renderer.endStripTarget();
+        renderer.writeGrayscalePlaneStrip(false, scratch.get(), y, rows);
+      }
+      const auto tGrayMsb = millis();
+
+      renderer.setRenderMode(GfxRenderer::BW);
+      renderer.displayGrayBuffer();
+      const auto tGrayDisplay = millis();
+
+      // BW framebuffer is intact; re-sync controller RAM for the next
+      // differential page turn directly from it.
       renderer.cleanupGrayscaleWithFrameBuffer();
-      LOG_DBG("ERS", "AA fallback: re-rendered BW buffer");
+      const auto tCleanup = millis();
+
+      const auto tEnd = millis();
+      LOG_DBG("ERS",
+              "Page render (tiled): prewarm=%lums bw_render=%lums display=%lums gray_lsb=%lums "
+              "gray_msb=%lums gray_display=%lums cleanup=%lums total=%lums",
+              tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tGrayLsb - tDisplay, tGrayMsb - tGrayLsb,
+              tGrayDisplay - tGrayMsb, tCleanup - tGrayDisplay, tEnd - t0);
     }
-    const auto tBwRestore = millis();
-
-    const auto tEnd = millis();
-    LOG_DBG("ERS",
-            "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store=%lums "
-            "gray_lsb=%lums gray_msb=%lums gray_display=%lums bw_restore=%lums total=%lums",
-            tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
-            tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
   } else {
-    const auto tEnd = millis();
-    LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums", tPrewarm - t0,
-            tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
+    // Fallback path for a controller without strip support. grayscale rendering
+    // TODO: Only do this if font supports it
+    if (SETTINGS.textAntiAliasing) {
+      // Save the BW frame before the grayscale passes overwrite it, restore
+      // after. Only needed when grayscale actually renders.
+      renderer.storeBwBuffer();
+      const auto tBwStore = millis();
 
-    // AA was skipped due to rapid burst — stash the page so loop() can settle it
-    // with a grayscale pass once input goes idle. AA-off case is also covered here
-    // but rapidBurst guards the stash so we don't keep the page alive needlessly.
-    if (rapidBurst && SETTINGS.textAntiAliasing && section) {
-      pendingSettlePage = std::move(page);
-      pendingSettleSpineIdx = currentSpineIndex;
-      pendingSettlePageIdx = section->currentPage;
-      pendingSettleMarginTop = orientedMarginTop;
-      pendingSettleMarginLeft = orientedMarginLeft;
-      settleAlreadyRequested = false;
-      aaSettlePending.store(true);
+      renderer.clearScreen(0x00);
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      renderer.copyGrayscaleLsbBuffers();
+      const auto tGrayLsb = millis();
+
+      // Render and copy to MSB buffer
+      renderer.clearScreen(0x00);
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      renderer.copyGrayscaleMsbBuffers();
+      const auto tGrayMsb = millis();
+
+      // display grayscale part
+      renderer.displayGrayBuffer();
+      const auto tGrayDisplay = millis();
+      renderer.setRenderMode(GfxRenderer::BW);
+      renderer.restoreBwBuffer();
+      const auto tBwRestore = millis();
+
+      const auto tEnd = millis();
+      LOG_DBG("ERS",
+              "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store=%lums "
+              "gray_lsb=%lums gray_msb=%lums gray_display=%lums bw_restore=%lums total=%lums",
+              tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
+              tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
+    } else {
+      // No anti-aliasing: BW frame already displayed above, no grayscale to
+      // render, so no save/restore.
+      const auto tEnd = millis();
+      LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums", tPrewarm - t0,
+              tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
     }
   }
 }
@@ -1212,6 +1350,58 @@ void EpubReaderActivity::restoreSavedPosition() {
   requestUpdate();
 }
 
+void EpubReaderActivity::addBookmark() {
+  if (!section || !epub) {
+    return;
+  }
+  LOG_DBG("ERS", "Adding bookmark at spine %d, page %d", currentSpineIndex, section ? section->currentPage : -1);
+  int currentPage;
+  int pageCount;
+  {
+    RenderLock lock(*this);
+    pageCount = section->pageCount;
+    currentPage = section->currentPage;
+  }
+
+  std::string pageText;
+  if (currentPage >= 0 && currentPage < pageCount) {
+    pageText = section->getTextFromSectionFile();
+  }
+
+  SavedProgressPosition progress = ProgressMapper::toSavedProgress(epub, getCurrentPosition());
+
+  BookmarkEntry entry;
+  entry.percentage = progress.percentage;
+  entry.xpath = progress.xpath;
+  entry.summary = BookmarkUtil::sanitizeBookmarkSummary(pageText);
+
+  // Add bookmark
+  const std::string path = BookmarkUtil::getBookmarkPath(epub->getPath());
+  LOG_DBG("ERS", "Bookmark path: %s", path.c_str());
+  const std::string bookmarksDir = BookmarkUtil::getBookmarksDir();
+  Storage.mkdir(bookmarksDir.c_str());
+  std::vector<BookmarkEntry> bookmarks;
+  if (Storage.exists(path.c_str())) {
+    LOG_DBG("ERS", "Existing bookmark file found, loading bookmarks");
+    String json = Storage.readFile(path.c_str());
+    if (!json.isEmpty()) {
+      JsonSettingsIO::loadBookmarks(bookmarks, json.c_str());
+    }
+  } else {
+    LOG_DBG("ERS", "No existing bookmark file, starting with empty bookmark list");
+  }
+  bookmarks.insert(bookmarks.begin(), entry);
+  LOG_DBG("ERS", "Saving bookmark to file: %s", path.c_str());
+  const bool ok = JsonSettingsIO::saveBookmarks(bookmarks, path.c_str());
+  if (ok) {
+    showBookmarkMessage = true;
+  } else {
+    LOG_ERR("ERS", "Failed to save bookmark to: %s", path.c_str());
+  }
+
+  requestUpdate();
+}
+
 ScreenshotInfo EpubReaderActivity::getScreenshotInfo() const {
   ScreenshotInfo info;
   info.readerType = ScreenshotInfo::ReaderType::Epub;
@@ -1231,4 +1421,24 @@ ScreenshotInfo EpubReaderActivity::getScreenshotInfo() const {
     }
   }
   return info;
+}
+
+CrossPointPosition EpubReaderActivity::getCurrentPosition() const {
+  const int currentPage = section ? section->currentPage : nextPageNumber;
+  const int totalPages = section ? section->pageCount : cachedChapterTotalPageCount;
+  std::optional<uint16_t> paragraphIndex;
+  if (section && currentPage >= 0 && currentPage < section->pageCount) {
+    const uint16_t paragraphPage =
+        currentPage > 0 ? static_cast<uint16_t>(currentPage - 1) : static_cast<uint16_t>(currentPage);
+    if (const auto pIdx = section->getParagraphIndexForPage(paragraphPage)) {
+      paragraphIndex = *pIdx;
+    }
+  }
+
+  CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPages};
+  if (paragraphIndex.has_value()) {
+    localPos.paragraphIndex = *paragraphIndex;
+    localPos.hasParagraphIndex = true;
+  }
+  return localPos;
 }

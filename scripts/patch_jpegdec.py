@@ -1,68 +1,91 @@
 """
-PlatformIO pre-build script: patch JPEGDEC for MCU_SKIP wild pointer crash.
+PlatformIO pre-build script: apply CrossPoint's JPEGDEC patches via `git apply`.
 
-Problem:
-  JPEGDecodeMCU_P computes pMCU = &sMCUs[iMCU & 0xffffff].  When iMCU is
-  MCU_SKIP (-8), the bitmask produces index 0xFFFFF8 (16 777 208), creating a
-  pointer ~33 MB past the 392-entry sMCUs array.  If the progressive JPEG's
-  first scan includes AC coefficients (iScanEnd > 0), the AC decode loop writes
-  through this wild pointer and crashes with a store-access fault.
+The upstream JPEGDEC pin still has the wild-pointer + DC-write bugs in
+JPEGDecodeMCU_P that surface when EIGHT_BIT_GRAYSCALE decodes a 3-component
+progressive JPEG (each Y MCU drags two MCU_SKIP calls behind it for Cb/Cr).
+The patches in `scripts/jpegdec_patches/` carry the fix; this script applies
+each one against the libdep working tree.
 
-  Upstream commit 8628297 guarded the DC coefficient write (pMCU[0]) but not the
-  AC coefficient writes at indices 1-63.
+Idempotency by reset-then-apply: the patched file(s) are restored to the pinned
+pristine state (`git checkout`) and the series is applied fresh on every run.
+This avoids fragile "already applied?" detection -- the patches have overlapping
+hunk context (so they can't be reverse-checked one at a time) and the pre-script
+runs more than once per build.
 
-Fix:
-  Redirect pMCU to sMCUs[0] when MCU_SKIP is active.  Writes to sMCUs[1..63]
-  are harmless: for JPEG_SCALE_EIGHTH only sMCUs[0] is read for output, and
-  the DC write at sMCUs[0] is already guarded by the existing `if (iMCU >= 0)`
-  check.
-
-Applied idempotently — safe to run on every build.
+Patches live in `scripts/jpegdec_patches/` as one-commit-per-fix files
+(see the file headers for context). Applied in lexical order.
 """
 
-Import("env")
+Import("env")  # noqa: F821 (SCons-injected global)
 import os
+import subprocess
+import sys
+
+
+PATCH_DIR = os.path.join(env["PROJECT_DIR"], "scripts", "jpegdec_patches")  # noqa: F821
 
 
 def patch_jpegdec(env):
     libdeps_dir = os.path.join(env["PROJECT_DIR"], ".pio", "libdeps")
     if not os.path.isdir(libdeps_dir):
         return
+    patches = _patch_files()
     for env_dir in os.listdir(libdeps_dir):
-        jpeg_inl = os.path.join(libdeps_dir, env_dir, "JPEGDEC", "src", "jpeg.inl")
-        if os.path.isfile(jpeg_inl):
-            _apply_mcu_skip_pointer_fix(jpeg_inl)
+        jpeg_dir = os.path.join(libdeps_dir, env_dir, "JPEGDEC")
+        if not os.path.isdir(os.path.join(jpeg_dir, ".git")):
+            continue
+        _apply_all(jpeg_dir, patches)
 
 
-def _apply_mcu_skip_pointer_fix(filepath):
-    MARKER = "// CrossPoint patch: safe pMCU for MCU_SKIP"
-    with open(filepath, "r") as f:
-        content = f.read()
-
-    if MARKER in content:
-        return  # already patched
-
-    # The wild-pointer line in JPEGDecodeMCU_P:
-    OLD = "    signed short *pMCU = &pJPEG->sMCUs[iMCU & 0xffffff];"
-
-    NEW = (
-        "    " + MARKER + "\n"
-        "    signed short *pMCU = (iMCU < 0) ? pJPEG->sMCUs\n"
-        "                                     : &pJPEG->sMCUs[iMCU & 0xffffff];"
-    )
-
-    if OLD not in content:
-        print(
-            "WARNING: JPEGDEC MCU_SKIP pointer patch target not found in %s "
-            "— library may have been updated" % filepath
+def _patch_files():
+    if not os.path.isdir(PATCH_DIR):
+        raise RuntimeError(
+            "JPEGDEC patches missing -- aborting build (expected directory %s)"
+            % PATCH_DIR
         )
-        return
+    patches = sorted(
+        os.path.join(PATCH_DIR, name)
+        for name in os.listdir(PATCH_DIR)
+        if name.endswith(".patch")
+    )
+    if not patches:
+        raise RuntimeError(
+            "JPEGDEC patches missing -- aborting build (no .patch files in %s)"
+            % PATCH_DIR
+        )
+    return patches
 
-    content = content.replace(OLD, NEW, 1)
-    with open(filepath, "w") as f:
-        f.write(content)
-    print("Patched JPEGDEC: safe pMCU for MCU_SKIP in JPEGDecodeMCU_P: %s" % filepath)
+
+def _apply_all(jpeg_dir, patches):
+    names = ", ".join(os.path.basename(p) for p in patches)
+    targets = _patch_targets(patches)
+    # Restore the patched files to the pinned pristine state, then apply fresh.
+    subprocess.run(["git", "checkout", "--"] + targets, cwd=jpeg_dir, check=True)
+    result = subprocess.run(
+        ["git", "apply"] + patches, cwd=jpeg_dir, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        # The libdep source has diverged from what the patches expect.
+        sys.stderr.write(
+            "ERROR: JPEGDEC patches do not apply cleanly:\n%s%s\n"
+            % (result.stdout, result.stderr)
+        )
+        raise SystemExit(1)
+    print("Applied JPEGDEC patches: %s" % names)
 
 
-# Run immediately at script import time (before compilation).
-patch_jpegdec(env)
+def _patch_targets(patches):
+    """Files touched by the patches (parsed from their `+++ b/<path>` headers)."""
+    targets = []
+    for patch in patches:
+        with open(patch, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("+++ b/"):
+                    path = line[len("+++ b/"):].strip()
+                    if path and path not in targets:
+                        targets.append(path)
+    return targets
+
+
+patch_jpegdec(env)  # noqa: F821

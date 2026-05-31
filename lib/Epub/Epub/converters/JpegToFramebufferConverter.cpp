@@ -5,6 +5,7 @@
 #include <HalStorage.h>
 #include <JPEGDEC.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <cstdlib>
 #include <memory>
@@ -20,7 +21,7 @@ namespace {
 
 // Context struct passed through JPEGDEC callbacks to avoid global mutable state.
 // The draw callback receives this via pDraw->pUser (set by setUserPointer()).
-// The file I/O callbacks receive the FsFile* via pFile->fHandle (set by jpegOpen()).
+// The file I/O callbacks receive the HalFile* via pFile->fHandle (set by jpegOpen()).
 struct JpegContext {
   GfxRenderer* renderer{nullptr};
   const RenderConfig* config{nullptr};
@@ -49,10 +50,10 @@ struct JpegContext {
   bool caching{false};
 };
 
-// File I/O callbacks use pFile->fHandle to access the FsFile*,
+// File I/O callbacks use pFile->fHandle to access the HalFile*,
 // avoiding the need for global file state.
 void* jpegOpen(const char* filename, int32_t* size) {
-  std::unique_ptr<FsFile> f(new (std::nothrow) FsFile());
+  std::unique_ptr<HalFile> f(new (std::nothrow) HalFile());
   if (!f) {
     LOG_ERR("JPG", "Failed to allocate file handle for JPEG");
     return nullptr;
@@ -65,7 +66,7 @@ void* jpegOpen(const char* filename, int32_t* size) {
 }
 
 void jpegClose(void* handle) {
-  FsFile* f = reinterpret_cast<FsFile*>(handle);
+  HalFile* f = reinterpret_cast<HalFile*>(handle);
   if (f) {
     f->close();
     delete f;
@@ -77,7 +78,7 @@ void jpegClose(void* handle) {
 // MUST maintain iPos to match the actual file position, otherwise progressive
 // JPEGs with large headers fail during parsing.
 int32_t jpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  FsFile* f = reinterpret_cast<FsFile*>(pFile->fHandle);
+  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
   if (!f) return 0;
   int32_t bytesRead = f->read(pBuf, len);
   if (bytesRead < 0) return 0;
@@ -86,7 +87,7 @@ int32_t jpegRead(JPEGFILE* pFile, uint8_t* pBuf, int32_t len) {
 }
 
 int32_t jpegSeek(JPEGFILE* pFile, int32_t pos) {
-  FsFile* f = reinterpret_cast<FsFile*>(pFile->fHandle);
+  HalFile* f = reinterpret_cast<HalFile*>(pFile->fHandle);
   if (!f) return -1;
   if (!f->seek(pos)) return -1;
   pFile->iPos = pos;

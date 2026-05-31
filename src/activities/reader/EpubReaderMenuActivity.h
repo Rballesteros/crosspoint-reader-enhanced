@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "../Activity.h"
+#include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
 class EpubReaderMenuActivity final : public Activity {
@@ -17,6 +17,7 @@ class EpubReaderMenuActivity final : public Activity {
     GO_TO_PERCENT,
     AUTO_PAGE_TURN,
     ROTATE_SCREEN,
+    BOOKMARKS,
     SCREENSHOT,
     DISPLAY_QR,
     GO_HOME,

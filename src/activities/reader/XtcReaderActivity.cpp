@@ -515,7 +515,7 @@ void XtcReaderActivity::renderPage() {
 }
 
 void XtcReaderActivity::saveProgress() const {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForWrite("XTR", xtc->getCachePath() + "/progress.bin", f)) {
     const uint32_t totalPages = xtc ? xtc->getPageCount() : 0;
     uint8_t data[8];
@@ -533,7 +533,7 @@ void XtcReaderActivity::saveProgress() const {
 }
 
 void XtcReaderActivity::loadProgress() {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForRead("XTR", xtc->getCachePath() + "/progress.bin", f)) {
     uint8_t data[8] = {0};
     const int read = f.read(data, sizeof(data));

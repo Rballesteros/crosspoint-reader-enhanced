@@ -4,14 +4,14 @@
 
 #include <algorithm>
 
-void EpdFont::getTextBounds(std::string_view string, const int startX, const int startY, int* minX, int* minY, int* maxX,
+void EpdFont::getTextBounds(const char* string, const int startX, const int startY, int* minX, int* minY, int* maxX,
                             int* maxY) const {
   *minX = startX;
   *minY = startY;
   *maxX = startX;
   *maxY = startY;
 
-  if (string.empty()) {
+  if (*string == '\0') {
     return;
   }
 
@@ -22,7 +22,7 @@ void EpdFont::getTextBounds(std::string_view string, const int startX, const int
   int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
   uint32_t cp;
   uint32_t prevCp = 0;
-  while ((cp = utf8NextCodepoint(string))) {
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&string)))) {
     const bool isCombining = utf8IsCombiningMark(cp);
 
     if (!isCombining) {
@@ -71,7 +71,7 @@ void EpdFont::getTextBounds(std::string_view string, const int startX, const int
   }
 }
 
-void EpdFont::getTextDimensions(std::string_view string, int* w, int* h) const {
+void EpdFont::getTextDimensions(const char* string, int* w, int* h) const {
   int minX = 0, minY = 0, maxX = 0, maxY = 0;
 
   getTextBounds(string, 0, 0, &minX, &minY, &maxX, &maxY);
@@ -104,30 +104,11 @@ int8_t EpdFont::getKerning(const uint32_t leftCp, const uint32_t rightCp) const 
   if (!data->kernMatrix) {
     return 0;
   }
-
-  // Check tiny cache first (LRU-ish)
-  for (uint8_t i = 0; i < 8; i++) {
-    if (kernCache[i].left == leftCp && kernCache[i].right == rightCp) {
-      return kernCache[i].kern;
-    }
-  }
-
   const uint8_t lc = lookupKernClass(data->kernLeftClasses, data->kernLeftEntryCount, leftCp);
-  int8_t kern = 0;
-  if (lc != 0) {
-    const uint8_t rc = lookupKernClass(data->kernRightClasses, data->kernRightEntryCount, rightCp);
-    if (rc != 0) {
-      kern = data->kernMatrix[(lc - 1) * data->kernRightClassCount + (rc - 1)];
-    }
-  }
-
-  // Update cache
-  kernCache[kernCacheIdx].left = leftCp;
-  kernCache[kernCacheIdx].right = rightCp;
-  kernCache[kernCacheIdx].kern = kern;
-  kernCacheIdx = (kernCacheIdx + 1) & 7;
-
-  return kern;
+  if (lc == 0) return 0;
+  const uint8_t rc = lookupKernClass(data->kernRightClasses, data->kernRightEntryCount, rightCp);
+  if (rc == 0) return 0;
+  return data->kernMatrix[(lc - 1) * data->kernRightClassCount + (rc - 1)];
 }
 
 uint32_t EpdFont::getLigature(const uint32_t leftCp, const uint32_t rightCp) const {
@@ -152,17 +133,17 @@ uint32_t EpdFont::getLigature(const uint32_t leftCp, const uint32_t rightCp) con
   return 0;
 }
 
-uint32_t EpdFont::applyLigatures(uint32_t cp, std::string_view& text) const {
+uint32_t EpdFont::applyLigatures(uint32_t cp, const char*& text) const {
   if (!data->ligaturePairs || data->ligaturePairCount == 0) {
     return cp;
   }
   while (true) {
-    std::string_view saved = text;
-    const uint32_t nextCp = utf8NextCodepoint(text);
+    const auto saved = reinterpret_cast<const uint8_t*>(text);
+    const uint32_t nextCp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text));
     if (nextCp == 0) break;
     const uint32_t lig = getLigature(cp, nextCp);
     if (lig == 0) {
-      text = saved;
+      text = reinterpret_cast<const char*>(saved);
       break;
     }
     cp = lig;

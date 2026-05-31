@@ -2,7 +2,7 @@
 #include <memory>
 #include <string_view>
 
-#include "../Activity.h"
+#include "activities/Activity.h"
 #include "activities/home/FileBrowserActivity.h"
 
 class Epub;

@@ -96,9 +96,9 @@ class HalFile : public Print {
   operator bool() const;
 };
 
-// Only do renaming FsFile to HalFile if this header is included by downstream code
-// The renaming is to allow using the thread-safe HalFile instead of the raw FsFile, without needing to change the
-// downstream code
+// Compatibility alias: legacy code that declares `FsFile` transparently uses the
+// thread-safe `HalFile` wrapper (all SD access must go through HalStorage's mutex).
+// Suppressed in HalStorage.cpp (HAL_STORAGE_IMPL), which needs SdFat's real FsFile.
 #ifndef HAL_STORAGE_IMPL
 using FsFile = HalFile;
 #endif

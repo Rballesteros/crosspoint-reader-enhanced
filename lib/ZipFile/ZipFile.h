@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 class ZipFile {
@@ -41,7 +42,7 @@ class ZipFile {
 
  private:
   const std::string& filePath;
-  FsFile file;
+  HalFile file;
   ZipDetails zipDetails = {0, 0, false};
   // Use std::map with transparent comparator so we can lookup with std::string_view
   // without allocating a temporary std::string per call (was a hot-path heap churn).
@@ -73,4 +74,11 @@ class ZipFile {
   // These functions will open and close the zip as needed
   std::vector<uint8_t> readFileToMemory(std::string_view filename, bool trailingNullByte = false);
   bool readFileToStream(std::string_view filename, Print& out, size_t chunkSize);
+
+  template <typename F>
+  void enumerateFilePaths(F&& callback) const {
+    for (const auto& entry : fileStatSlimCache) {
+      callback(std::string_view{entry.first});
+    }
+  }
 };

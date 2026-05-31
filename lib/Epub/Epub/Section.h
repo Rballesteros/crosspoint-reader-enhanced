@@ -14,7 +14,7 @@ class Section {
   const int spineIndex;
   GfxRenderer& renderer;
   std::string filePath;
-  FsFile file;
+  HalFile file;
 
   // Cached deserialized page for idle prefetch. Owned here; consumed by
   // loadPageFromSectionFile() when the requested page matches the slot.
@@ -47,6 +47,7 @@ class Section {
                          uint8_t imageRendering, bool focusReadingEnabled,
                          const std::function<void()>& popupFn = nullptr, bool failOnSupportedImageErrors = false);
   std::unique_ptr<Page> loadPageFromSectionFile();
+  std::string getTextFromSectionFile();
 
   // Deserialize currentPage + 1 into the prefetch slot. Called during idle
   // reading so the next forward page turn can skip the SD read. Returns true on
@@ -55,6 +56,9 @@ class Section {
 
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
+
+  // Get the page count from the section cache file without fully loading it.
+  std::optional<uint16_t> getCachedPageCount() const;
 
   // Look up the page number for a synthetic paragraph index from XPath p[N].
   std::optional<uint16_t> getPageForParagraphIndex(uint16_t pIndex) const;

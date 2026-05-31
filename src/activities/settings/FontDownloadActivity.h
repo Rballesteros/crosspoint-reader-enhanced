@@ -34,7 +34,13 @@ class FontDownloadActivity : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
-  bool preventAutoSleep() override { return state_ == LOADING_MANIFEST || state_ == DOWNLOADING; }
+  bool preventAutoSleep() override {
+    return state_ == LOADING_MANIFEST || state_ == DOWNLOADING ||
+           // The download is synchronous and blocks the main loop until it
+           // completes, so activityManager.preventAutoSleep() is never polled
+           // during downloading.
+           state_ == COMPLETE || state_ == ERROR;
+  }
   bool skipLoopDelay() override { return true; }
 
  private:
@@ -79,18 +85,25 @@ class FontDownloadActivity : public Activity {
   size_t fileTotal_ = 0;
   int downloadingFamilyIndex_ = 0;
   std::string errorMessage_;
+  bool cancelRequested_ = false;
 
   void onWifiSelectionComplete(bool success);
   bool fetchAndParseManifest();
   void downloadFamily(ManifestFamily& family);
   void downloadAll();
+  void updateAll();
   static bool computeFileCrc32(const char* path, uint32_t& outCrc);
-  bool isDownloadAllSelected() const { return selectedIndex_ == 0 && !families_.empty(); }
+  bool showDownloadAllRow() const;
+  bool showUpdateAllRow() const;
+  int specialRowCount() const;
+  bool isDownloadAllRow(int index) const;
+  bool isUpdateAllRow(int index) const;
   bool isSelectedFamilyDeletable() const;
   void promptDeleteSelectedFamily();
   void onDeleteConfirmationResult(const ActivityResult& result);
-  int familyIndexFromList(int listIndex) const { return listIndex - 1; }
-  int listItemCount() const { return families_.empty() ? 0 : static_cast<int>(families_.size()) + 1; }
-  size_t totalUninstalledSize() const;
+  int familyIndexFromList(int listIndex) const { return listIndex - specialRowCount(); }
+  int listItemCount() const;
+  size_t totalDownloadSize() const;
+  size_t totalUpdateSize() const;
   static std::string formatSize(size_t bytes);
 };

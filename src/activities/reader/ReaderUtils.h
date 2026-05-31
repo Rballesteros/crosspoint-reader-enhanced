@@ -14,6 +14,8 @@ namespace ReaderUtils {
 
 constexpr unsigned long GO_HOME_MS = 1000;
 constexpr unsigned long SKIP_HOLD_MS = 700;
+constexpr unsigned long BOOKMARK_HOLD_MS = 400;
+constexpr unsigned long BOOKMARK_MESSAGE_DURATION_MS = 2500;
 
 // Deferred anti-aliasing "settle" tuning, shared by the EPUB and TXT readers.
 // During a rapid burst of page turns the grayscale pass is skipped and deferred
@@ -76,16 +78,21 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   const bool usePress = !allowLongPressChapterSkip();
   const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
   const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
-  const bool prev = tiltPrev || (usePress ? (input.wasPressed(MappedInputManager::Button::PageBack) ||
-                                             input.wasPressed(MappedInputManager::Button::Left))
-                                          : (input.wasReleased(MappedInputManager::Button::PageBack) ||
-                                             input.wasReleased(MappedInputManager::Button::Left)));
+  const bool swapFront =
+      SETTINGS.frontButtonFollowOrientation && (SETTINGS.orientation == CrossPointSettings::INVERTED ||
+                                                SETTINGS.orientation == CrossPointSettings::LANDSCAPE_CCW);
+  const auto prevButton = swapFront ? MappedInputManager::Button::Right : MappedInputManager::Button::Left;
+  const auto nextButton = swapFront ? MappedInputManager::Button::Left : MappedInputManager::Button::Right;
+  const bool prev =
+      tiltPrev ||
+      (usePress ? (input.wasPressed(MappedInputManager::Button::PageBack) || input.wasPressed(prevButton))
+                : (input.wasReleased(MappedInputManager::Button::PageBack) || input.wasReleased(prevButton)));
   const bool powerTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
                          input.wasReleased(MappedInputManager::Button::Power);
   const bool next = tiltNext || (usePress ? (input.wasPressed(MappedInputManager::Button::PageForward) || powerTurn ||
-                                             input.wasPressed(MappedInputManager::Button::Right))
+                                             input.wasPressed(nextButton))
                                           : (input.wasReleased(MappedInputManager::Button::PageForward) || powerTurn ||
-                                             input.wasReleased(MappedInputManager::Button::Right)));
+                                             input.wasReleased(nextButton)));
   return {prev, next, tiltPrev || tiltNext};
 }
 

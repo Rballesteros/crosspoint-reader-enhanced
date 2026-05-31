@@ -97,7 +97,7 @@ struct PixelCache {
   bool writeToFile(std::string_view cachePath) {
     if (!buffer || bufferSize == 0) return false;
 
-    FsFile cacheFile;
+    HalFile cacheFile;
     if (!Storage.openFileForWrite("IMG", std::string(cachePath), cacheFile)) {
       LOG_ERR("IMG", "Failed to open cache file for writing: %.*s", static_cast<int>(cachePath.size()), cachePath.data());
       return false;
