@@ -1,8 +1,10 @@
 #pragma once
 #include <Epub.h>
 #include <Epub/FootnoteEntry.h>
+#include <Epub/Page.h>
 #include <Epub/Section.h>
 
+#include <atomic>
 #include <optional>
 
 #include "EpubReaderMenuActivity.h"
@@ -22,6 +24,18 @@ class EpubReaderActivity final : public Activity {
   int cachedChapterTotalPageCount = 0;
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
+
+  // Deferred AA settle: during rapid burst page turns, renderContents skips the
+  // grayscale pass and stashes the page here. loop() triggers a settle render
+  // once input has been idle long enough; render() honours it.
+  bool currentTurnIsRapid = false;
+  std::atomic<bool> aaSettlePending{false};
+  std::unique_ptr<Page> pendingSettlePage;
+  int pendingSettleSpineIdx = -1;
+  int pendingSettlePageIdx = -1;
+  int pendingSettleMarginTop = 0;
+  int pendingSettleMarginLeft = 0;
+  bool settleAlreadyRequested = false;
   // Signals that the next render should reposition within the newly loaded section
   // based on a cross-book percentage jump.
   bool pendingPercentJump = false;
@@ -46,6 +60,13 @@ class EpubReaderActivity final : public Activity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
+  // Runs only the grayscale LSB/MSB render + display pass for an already-displayed
+  // BW page (the page is owned by pendingSettlePage). Called from render() when a
+  // deferred AA settle is honoured.
+  void renderAaSettle();
+  // Clears any pending AA settle state. Called when section/spine changes
+  // invalidate the deferred page.
+  void clearAaSettle();
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.

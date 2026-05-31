@@ -11,13 +11,14 @@
 #include "fontIds.h"
 
 namespace {
-constexpr int MENU_ITEMS = 7;
+constexpr int MENU_ITEMS = 8;
 const StrId menuNames[MENU_ITEMS] = {StrId::STR_CHAPTER_PAGE_COUNT,
                                      StrId::STR_BOOK_PROGRESS_PERCENTAGE,
                                      StrId::STR_PROGRESS_BAR,
                                      StrId::STR_PROGRESS_BAR_THICKNESS,
                                      StrId::STR_TITLE,
                                      StrId::STR_BATTERY,
+                                     StrId::STR_BLUETOOTH,
                                      StrId::STR_XTC_STATUS_BAR};
 constexpr int PROGRESS_BAR_ITEMS = 3;
 const StrId progressBarNames[PROGRESS_BAR_ITEMS] = {StrId::STR_BOOK, StrId::STR_CHAPTER, StrId::STR_HIDE};
@@ -119,6 +120,10 @@ void StatusBarSettingsActivity::handleSelection() {
     // Show Battery
     SETTINGS.statusBarBattery = (SETTINGS.statusBarBattery + 1) % 2;
   } else if (selectedIndex == 6) {
+    // Show Bluetooth indicator in the reader status bar. The top status bar
+    // is unconditional — it always shows the icon when BT is on.
+    SETTINGS.statusBarBluetooth = (SETTINGS.statusBarBluetooth + 1) % 2;
+  } else if (selectedIndex == 7) {
     // XTC Status Bar
     SETTINGS.xtcStatusBarMode = (SETTINGS.xtcStatusBarMode + 1) % XTC_STATUS_BAR_ITEMS;
   }
@@ -155,6 +160,8 @@ void StatusBarSettingsActivity::render(RenderLock&&) {
         } else if (index == 5) {
           return SETTINGS.statusBarBattery ? tr(STR_SHOW) : tr(STR_HIDE);
         } else if (index == 6) {
+          return SETTINGS.statusBarBluetooth ? tr(STR_SHOW) : tr(STR_HIDE);
+        } else if (index == 7) {
           return I18N.get(xtcStatusBarNames[SETTINGS.xtcStatusBarMode]);
         } else {
           return tr(STR_HIDE);

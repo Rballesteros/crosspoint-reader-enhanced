@@ -106,6 +106,8 @@ class BookMetadataCache {
   // Reading phase (read mode)
   bool load();
   SpineEntry getSpineEntry(int index);
+  uint32_t getSpineCumulativeSize(int index);
+  int16_t getSpineTocIndex(int index);
   int16_t getSpineIndexForHref(std::string_view href) const;
   TocEntry getTocEntry(int index);
   int getSpineCount() const { return spineCount; }

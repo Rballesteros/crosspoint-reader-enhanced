@@ -17,13 +17,12 @@ static_assert(std::is_standard_layout<InflateReader>::value,
 
 InflateReader::~InflateReader() { deinit(); }
 
-bool InflateReader::init(const bool streaming, size_t dictSize) {
+bool InflateReader::init(const bool streaming, size_t dictSize, const size_t safetyMargin) {
   deinit();  // free any previously allocated ring buffer and reset state
 
   if (streaming) {
     if (dictSize == 0) dictSize = INFLATE_DICT_SIZE;
-    constexpr size_t SAFETY_MARGIN = 16 * 1024;
-    if (!HeapBudget::canAllocate(dictSize, dictSize, SAFETY_MARGIN, "INF", "inflate ring buffer")) {
+    if (!HeapBudget::canAllocate(dictSize, dictSize, safetyMargin, "INF", "inflate ring buffer")) {
       return false;
     }
     ringBuffer = static_cast<uint8_t*>(heap_caps_calloc(dictSize, 1, MALLOC_CAP_8BIT));

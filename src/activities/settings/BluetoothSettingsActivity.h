@@ -2,26 +2,24 @@
 
 #include <BluetoothHIDManager.h>
 #include <GfxRenderer.h>
+
 #include <string>
 
-#include "activities/Activity.h"
 #include "MappedInputManager.h"
+#include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
 class BluetoothSettingsActivity : public Activity {
  private:
-  enum class ViewMode {
-    MAIN_MENU,
-    DEVICE_LIST,
-    LEARN_KEYS,
-    DEBUG_MONITOR
-  };
+  enum class ViewMode { MAIN_MENU, DEVICE_LIST, LEARN_KEYS, DEBUG_MONITOR };
 
   enum class LearnStep {
-    WAIT_PREV,
-    WAIT_NEXT,
-    WAIT_CONFIRM,  // Optional 3rd button: BTN_CONFIRM action
-    WAIT_CANCEL,   // Optional 4th button: BTN_BACK action
+    WAIT_PREV,     // Page-forward button (required)
+    WAIT_NEXT,     // Page-back button (required)
+    WAIT_CONFIRM,  // Optional: Confirm/Select action
+    WAIT_CANCEL,   // Optional: Back/Cancel action
+    WAIT_LEFT,     // Optional: Left navigation (GameBrick joystick, multi-button remotes)
+    WAIT_RIGHT,    // Optional: Right navigation
     WAIT_TEST,
     DONE
   };
@@ -38,7 +36,8 @@ class BluetoothSettingsActivity : public Activity {
   uint8_t learnedNextKey = 0;
   uint8_t learnedConfirmKey = 0;  // 0 = not learned (skipped or never set)
   uint8_t learnedCancelKey = 0;   // 0 = not learned
-  uint8_t learnedReportIndex = 2;
+  uint8_t learnedLeftKey = 0;     // 0 = not learned
+  uint8_t learnedRightKey = 0;    // 0 = not learned
   unsigned long learnTestDeadlineMs = 0;
   bool learnTestForwardSeen = false;
   bool learnTestBackSeen = false;
@@ -60,9 +59,9 @@ class BluetoothSettingsActivity : public Activity {
   bool exitOnSuccessfulConnect = false;
 
   // Device-list view state
-  std::string highlightedAddress;            // BLE address the cursor is "on" (so sort doesn't lose it)
-  bool showOnlyHID = false;                  // Filter list to HID-advertising devices only
-  unsigned long lastDeviceListRefresh = 0;   // millis() of last live re-render during scan
+  std::string highlightedAddress;           // BLE address the cursor is "on" (so sort doesn't lose it)
+  bool showOnlyHID = false;                 // Filter list to HID-advertising devices only
+  unsigned long lastDeviceListRefresh = 0;  // millis() of last live re-render during scan
   ButtonNavigator buttonNavigator;
 
  public:

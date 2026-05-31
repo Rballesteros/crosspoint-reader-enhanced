@@ -56,7 +56,11 @@ void ConfirmationActivity::render(RenderLock&& lock) {
 }
 
 void ConfirmationActivity::loop() {
-  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+  // Accept Right OR Confirm as Yes, Left OR Back as No. This lets a BLE
+  // remote that only has Confirm/Back mapped answer the dialog without
+  // requiring the user to also map Left/Right in the learn wizard.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Right) ||
+      mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     ActivityResult res;
     res.isCancelled = false;
     setResult(std::move(res));
@@ -64,7 +68,8 @@ void ConfirmationActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+  if (mappedInput.wasReleased(MappedInputManager::Button::Left) ||
+      mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult res;
     res.isCancelled = true;
     setResult(std::move(res));

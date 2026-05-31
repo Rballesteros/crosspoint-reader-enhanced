@@ -19,9 +19,14 @@ namespace {
 constexpr uint16_t ZIP_METHOD_STORED = 0;
 constexpr uint16_t ZIP_METHOD_DEFLATED = 8;
 constexpr size_t ZIP_ALLOC_SAFETY_MARGIN = 16 * 1024;
+constexpr size_t ZIP_STREAM_ALLOC_SAFETY_MARGIN = 8 * 1024;
 
 bool hasZipHeap(const size_t totalBytes, const size_t largestBlock, const char* label) {
   return HeapBudget::canAllocate(totalBytes, largestBlock, ZIP_ALLOC_SAFETY_MARGIN, "ZIP", label);
+}
+
+bool hasZipStreamHeap(const size_t totalBytes, const size_t largestBlock, const char* label) {
+  return HeapBudget::canAllocate(totalBytes, largestBlock, ZIP_STREAM_ALLOC_SAFETY_MARGIN, "ZIP", label);
 }
 
 // RAII zip: opens the zip if not already open, closes on destruction only if
@@ -384,8 +389,8 @@ std::vector<uint8_t> ZipFile::readFileToMemory(std::string_view filename, const 
                                  ? static_cast<size_t>(dataSize) + static_cast<size_t>(deflatedDataSize)
                                  : static_cast<size_t>(dataSize);
   const size_t largestNeeded = fileStat.method == ZIP_METHOD_DEFLATED
-                                  ? std::max(static_cast<size_t>(dataSize), static_cast<size_t>(deflatedDataSize))
-                                  : static_cast<size_t>(dataSize);
+                                   ? std::max(static_cast<size_t>(dataSize), static_cast<size_t>(deflatedDataSize))
+                                   : static_cast<size_t>(dataSize);
   if (!hasZipHeap(totalNeeded, largestNeeded, "readFileToMemory buffers")) {
     return {};
   }
@@ -476,13 +481,20 @@ bool ZipFile::readFileToStream(std::string_view filename, Print& out, const size
 
   if (fileStat.method == ZIP_METHOD_DEFLATED) {
     const size_t dictSize = std::min(static_cast<size_t>(32768), static_cast<size_t>(inflatedDataSize));
-    if (!hasZipHeap(chunkSize * 2 + dictSize, std::max(chunkSize, dictSize), "deflated stream buffers")) {
+    if (!hasZipStreamHeap(chunkSize * 2 + dictSize, std::max(chunkSize, dictSize), "deflated stream buffers")) {
       return false;
     }
+    ZipInflateCtx ctx;
+    // Required EPUB section streaming uses only two small chunk buffers plus the
+    // DEFLATE dictionary. Claim the largest block first to avoid self-fragmenting.
+    if (!ctx.reader.init(true, dictSize, ZIP_STREAM_ALLOC_SAFETY_MARGIN)) {
+      LOG_ERR("ZIP", "Failed to init inflate reader (dictSize=%u)", static_cast<unsigned>(dictSize));
+      return false;
+    }
+
     std::vector<uint8_t> fileReadBuffer(chunkSize);
     std::vector<uint8_t> outputBuffer(chunkSize);
 
-    ZipInflateCtx ctx;
     ctx.file = &file;
     ctx.fileRemaining = deflatedDataSize;
     ctx.readBuf = fileReadBuffer.data();
@@ -491,10 +503,6 @@ bool ZipFile::readFileToStream(std::string_view filename, Print& out, const size
     // Decompressing in chunks requires a dictionary (ring buffer) to resolve
     // back-references. Standard DEFLATE allows distances up to 32KB, but for
     // small files we only need a buffer as large as the total uncompressed size.
-    if (!ctx.reader.init(true, dictSize)) {
-      LOG_ERR("ZIP", "Failed to init inflate reader (dictSize=%u)", static_cast<unsigned>(dictSize));
-      return false;
-    }
     ctx.reader.setReadCallback(zipReadCallback);
 
     bool success = false;

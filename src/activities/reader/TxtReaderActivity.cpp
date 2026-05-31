@@ -1,5 +1,6 @@
 #include "TxtReaderActivity.h"
 
+#include <BluetoothHIDManager.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -23,6 +24,9 @@ constexpr size_t CHUNK_SIZE = 8 * 1024;  // 8KB chunk for reading
 // Cache file magic and version
 constexpr uint32_t CACHE_MAGIC = 0x54585449;  // "TXTI"
 constexpr uint8_t CACHE_VERSION = 3;          // Increment when cache format changes
+// Deferred-AA settle tuning is shared with the EPUB reader; see
+// ReaderUtils::{RAPID_TURN_THRESHOLD_MS, SETTLE_THRESHOLD_MS,
+// SETTLE_HEAP_GUARD_BYTES, SETTLE_BLOCK_GUARD_BYTES}.
 }  // namespace
 
 void TxtReaderActivity::onEnter() {
@@ -57,10 +61,18 @@ void TxtReaderActivity::onExit() {
   currentPageLines.clear();
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
+  clearAaSettle();
   txt.reset();
 }
 
 void TxtReaderActivity::loop() {
+  // Edge-triggered settle for deferred AA — same shape as EpubReaderActivity.
+  if (aaSettlePending.load() && !settleAlreadyRequested &&
+      (millis() - lastPageTurnTime) > ReaderUtils::SETTLE_THRESHOLD_MS && !RenderLock::peek()) {
+    settleAlreadyRequested = true;
+    requestUpdate();
+  }
+
   if (ReaderUtils::preferPressForBleInput() && mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     activityManager.goHome();
     return;
@@ -73,8 +85,7 @@ void TxtReaderActivity::loop() {
   }
 
   // Short press BACK goes directly to home
-  if (!ReaderUtils::preferPressForBleInput() &&
-      mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+  if (!ReaderUtils::preferPressForBleInput() && mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     activityManager.goHome();
     return;
@@ -85,13 +96,25 @@ void TxtReaderActivity::loop() {
     return;
   }
 
+  const auto triggerPageTurn = [this]() {
+    const auto now = millis();
+    // Only defer AA when a BLE remote is driving input (see EpubReaderActivity::
+    // pageTurn). Local-button turns render AA inline immediately.
+    const bool bleDrivingInput = BluetoothHIDManager::getInstance().hadRecentRemoteInput();
+    currentTurnIsRapid =
+        bleDrivingInput && (lastPageTurnTime != 0) && (now - lastPageTurnTime < ReaderUtils::RAPID_TURN_THRESHOLD_MS);
+    clearAaSettle();
+    lastPageTurnTime = now;
+    requestUpdate();
+  };
+
   if (prevTriggered && currentPage > 0) {
     currentPage--;
-    requestUpdate();
+    triggerPageTurn();
   } else if (nextTriggered) {
     if (currentPage < totalPages - 1) {
       currentPage++;
-      requestUpdate();
+      triggerPageTurn();
     } else {
       activityManager.goHome();
     }
@@ -325,6 +348,19 @@ void TxtReaderActivity::render(RenderLock&&) {
     return;
   }
 
+  // Deferred-AA settle path: if the stashed page still matches what's on screen,
+  // run only the grayscale pass. currentPageLines is still loaded from the
+  // previous render, so no SD reload is needed.
+  if (aaSettlePending.load()) {
+    if (pendingSettlePageIdx == currentPage && SETTINGS.textAntiAliasing && !currentPageLines.empty()) {
+      LOG_DBG("TRS", "AA settle: rendering grayscale pass for page %d", pendingSettlePageIdx);
+      renderAaSettle();
+      clearAaSettle();
+      return;
+    }
+    clearAaSettle();
+  }
+
   // Initialize reader if not done
   if (!initialized) {
     initializeReader();
@@ -354,55 +390,54 @@ void TxtReaderActivity::render(RenderLock&&) {
   saveProgress();
 }
 
-void TxtReaderActivity::renderPage() {
+void TxtReaderActivity::renderLinesIntoFramebuffer() const {
   const int lineHeight = renderer.getLineHeight(cachedFontId);
   const int contentWidth = viewportWidth;
 
-  // Render text lines with alignment
-  auto renderLines = [&]() {
-    int y = cachedOrientedMarginTop;
-    for (const auto& line : currentPageLines) {
-      if (!line.empty()) {
-        int x = cachedOrientedMarginLeft;
+  int y = cachedOrientedMarginTop;
+  for (const auto& line : currentPageLines) {
+    if (!line.empty()) {
+      int x = cachedOrientedMarginLeft;
 
-        // Apply text alignment
-        switch (cachedParagraphAlignment) {
-          case CrossPointSettings::LEFT_ALIGN:
-          default:
-            // x already set to left margin
-            break;
-          case CrossPointSettings::CENTER_ALIGN: {
-            int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
-            x = cachedOrientedMarginLeft + (contentWidth - textWidth) / 2;
-            break;
-          }
-          case CrossPointSettings::RIGHT_ALIGN: {
-            int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
-            x = cachedOrientedMarginLeft + contentWidth - textWidth;
-            break;
-          }
-          case CrossPointSettings::JUSTIFIED:
-            // For plain text, justified is treated as left-aligned
-            // (true justification would require word spacing adjustments)
-            break;
+      // Apply text alignment
+      switch (cachedParagraphAlignment) {
+        case CrossPointSettings::LEFT_ALIGN:
+        default:
+          // x already set to left margin
+          break;
+        case CrossPointSettings::CENTER_ALIGN: {
+          int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
+          x = cachedOrientedMarginLeft + (contentWidth - textWidth) / 2;
+          break;
         }
-
-        renderer.drawText(cachedFontId, x, y, line.c_str());
+        case CrossPointSettings::RIGHT_ALIGN: {
+          int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
+          x = cachedOrientedMarginLeft + contentWidth - textWidth;
+          break;
+        }
+        case CrossPointSettings::JUSTIFIED:
+          // For plain text, justified is treated as left-aligned
+          // (true justification would require word spacing adjustments)
+          break;
       }
-      y += lineHeight;
-    }
-  };
 
+      renderer.drawText(cachedFontId, x, y, line.c_str());
+    }
+    y += lineHeight;
+  }
+}
+
+void TxtReaderActivity::renderPage() {
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
-  renderLines();  // scan pass — text accumulated, no drawing
+  renderLinesIntoFramebuffer();  // scan pass — text accumulated, no drawing
   scope.endScanAndPrewarm();
 
   // BW rendering
   const bool bleCounterRefresh = ReaderUtils::shouldStrengthenBleStatusCounterRefresh(pagesUntilFullRefresh);
   const float progress = totalPages > 0 ? (currentPage + 1) * 100.0f / totalPages : 0.0f;
-  renderLines();
+  renderLinesIntoFramebuffer();
   renderStatusBar();
 
   ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
@@ -410,10 +445,54 @@ void TxtReaderActivity::renderPage() {
     ReaderUtils::refreshStatusBarCounterWindow(renderer, progress, currentPage + 1, totalPages);
   }
 
+  // Consume the burst flag set by loop(). Skip AA when in a rapid burst; settle
+  // it later via renderAaSettle() once the user idles.
+  const bool rapid = currentTurnIsRapid;
+  currentTurnIsRapid = false;
+
   if (SETTINGS.textAntiAliasing) {
-    ReaderUtils::renderAntiAliased(renderer, [&renderLines]() { renderLines(); });
+    if (rapid) {
+      pendingSettlePageIdx = currentPage;
+      settleAlreadyRequested = false;
+      aaSettlePending.store(true);
+    } else {
+      ReaderUtils::renderAntiAliased(
+          renderer, [this]() { renderLinesIntoFramebuffer(); },
+          [this]() {
+            renderLinesIntoFramebuffer();
+            renderStatusBar();
+          });
+    }
   }
   // scope destructor clears font cache via FontCacheManager
+}
+
+void TxtReaderActivity::renderAaSettle() {
+  // Heap gate — skip the settle when fragmentation makes the fallback re-render
+  // unsafe. The BW frame already on screen stays as the final state.
+  const size_t freeHeap = esp_get_free_heap_size();
+  const size_t maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap < ReaderUtils::SETTLE_HEAP_GUARD_BYTES || maxAlloc < ReaderUtils::SETTLE_BLOCK_GUARD_BYTES) {
+    LOG_DBG("TRS", "AA settle: skipped (free=%u maxAlloc=%u)", static_cast<unsigned>(freeHeap),
+            static_cast<unsigned>(maxAlloc));
+    return;
+  }
+  // skipBwStore=true: avoid the ~48KB storeBwBuffer allocation, which fragments
+  // the heap and can fault the grayscale render on a dense page (see
+  // EpubReaderActivity::renderAaSettle). Re-render the BW frame at the end instead.
+  ReaderUtils::renderAntiAliased(
+      renderer, [this]() { renderLinesIntoFramebuffer(); },
+      [this]() {
+        renderLinesIntoFramebuffer();
+        renderStatusBar();
+      },
+      /*skipBwStore=*/true);
+}
+
+void TxtReaderActivity::clearAaSettle() {
+  aaSettlePending.store(false);
+  pendingSettlePageIdx = -1;
+  settleAlreadyRequested = false;
 }
 
 void TxtReaderActivity::renderStatusBar() const {

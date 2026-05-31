@@ -1,5 +1,8 @@
 #include "HalSystem.h"
 
+#include <Preferences.h>
+
+#include <cstring>
 #include <string>
 
 #include "Arduino.h"
@@ -88,17 +91,48 @@ void begin() {
 }
 
 void checkPanic() {
-  if (isRebootFromPanic()) {
-    auto panicInfo = getPanicInfo(true);
-    auto file = Storage.open("/crash_report.txt", O_WRITE | O_CREAT | O_TRUNC);
-    if (file) {
-      file.write(panicInfo.c_str(), panicInfo.size());
-      file.close();
-      LOG_INF("SYS", "Dumped panic info to SD card");
-    } else {
-      LOG_ERR("SYS", "Failed to open crash_report.txt for writing");
+  if (!isRebootFromPanic()) {
+    return;
+  }
+
+  // Persistent crash sequence number lives in NVS so it survives cold boots
+  // and is independent of the SD-side log. Counter only advances when we
+  // actually dump, so a crash that fails to write doesn't burn a slot.
+  // The "crosspoint" namespace matches the convention used elsewhere
+  // (HalGPIO uses Preferences the same way).
+  constexpr const char* kCrashNvsNamespace = "crosspoint";
+  constexpr const char* kCrashSeqKey = "crash_seq";
+
+  uint32_t crashSeq = 0;
+  {
+    Preferences prefs;
+    if (prefs.begin(kCrashNvsNamespace, false)) {
+      crashSeq = prefs.getUInt(kCrashSeqKey, 0) + 1;
+      prefs.putUInt(kCrashSeqKey, crashSeq);
+      prefs.end();
     }
   }
+
+  const auto panicInfo = getPanicInfo(true);
+  // O_APPEND so successive crashes accumulate. Each entry is fenced by a
+  // banner header so the file remains scannable in a plain text editor.
+  auto file = Storage.open("/crash_report.txt", O_WRITE | O_CREAT | O_APPEND);
+  if (!file) {
+    LOG_ERR("SYS", "Failed to open crash_report.txt for writing");
+    return;
+  }
+
+  char header[160];
+  const int headerLen = snprintf(header, sizeof(header), "\n========== Crash #%u  ms_since_boot=%lu  ==========\n",
+                                 static_cast<unsigned>(crashSeq), static_cast<unsigned long>(millis()));
+  if (headerLen > 0) {
+    file.write(header, static_cast<size_t>(headerLen));
+  }
+  file.write(panicInfo.c_str(), panicInfo.size());
+  // Trailing blank line so the next entry's header starts on its own line.
+  file.write("\n", 1);
+  // No explicit close — DESTRUCTOR_CLOSES_FILE=1 closes `file` at scope exit.
+  LOG_INF("SYS", "Dumped panic info to SD card (crash #%u)", static_cast<unsigned>(crashSeq));
 }
 
 void clearPanic() {

@@ -1,10 +1,13 @@
 #pragma once
 
 #include <Arduino.h>
+
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
-#include "DeviceProfiles.h"
+
+#include "BleDecoders.h"
+#include "BleMappings.h"
 
 // Forward declarations
 class NimBLEClient;
@@ -16,9 +19,9 @@ struct BluetoothDevice {
   std::string name;
   int rssi;
   bool isHID = false;
-  uint8_t addrType = 0;  // BLE_ADDR_PUBLIC; populated from advertisedDevice->getAddress().getType()
-  uint16_t appearance = 0;     // BLE Appearance category (0 = unknown)
-  uint16_t companyId = 0xFFFF; // Manufacturer Bluetooth SIG company ID (0xFFFF = none)
+  uint8_t addrType = 0;         // BLE_ADDR_PUBLIC; populated from advertisedDevice->getAddress().getType()
+  uint16_t appearance = 0;      // BLE Appearance category (0 = unknown)
+  uint16_t companyId = 0xFFFF;  // Manufacturer Bluetooth SIG company ID (0xFFFF = none)
 };
 
 struct ConnectedDevice {
@@ -26,48 +29,59 @@ struct ConnectedDevice {
   std::string name;
   NimBLEClient* client = nullptr;
   std::vector<NimBLERemoteCharacteristic*> reportChars;
-  unsigned long connectedTime = 0;    // Timestamp when BLE link was established
+  unsigned long connectedTime = 0;  // Timestamp when BLE link was established
   bool subscribed = false;
-  unsigned long lastActivityTime = 0;  // Timestamp of last HID report received
-  uint8_t lastHIDKeycode = 0x00;       // Track last keycode to detect press/release transitions
-  unsigned long lastInjectionTime = 0; // Cooldown for button injection to prevent flooding
+  unsigned long lastActivityTime = 0;   // Timestamp of last HID report received
+  unsigned long lastInjectionTime = 0;  // Cooldown for button injection to prevent flooding
+  uint8_t activeInjectedButton = 0xFF;  // Currently held virtual button, if any
+  bool wasConnected = false;            // Track if this device was previously connected for auto-reconnect
+  bool hasSeenRelease = false;          // Ignore startup noise until a release frame is seen
+
+  // Decoder selection — what report format this device speaks. Chosen at
+  // connect time via BleDecoders::matchProfile. Decoder-private state lives
+  // in `decoderState` and is mutated by the decoder on every notify.
+  BleDecoders::Kind decoderKind = BleDecoders::Kind::GenericExtract;
+  BleDecoders::ReportHints reportHints;
+  BleDecoders::State decoderState;
+  const char* profileName = "Generic";
+
+  // Per-device user-learned mapping (BleMappings store). When null, the
+  // device produces no input until the user runs the learn wizard. There are
+  // no hardcoded defaults — unmapped keycodes are a deliberate no-op.
+  const BleMappings::Set* deviceMappings = nullptr;
+
+  // Last decoded frame (for press-transition detection and the jitter
+  // debounce window).
+  uint8_t lastDecodedKeycode = 0x00;
+  bool lastDecodedPressed = false;
+  unsigned long lastDecodedEventMs = 0;
   uint8_t lastInjectedKeycode = 0x00;  // Track last injected key for smarter cooldown
-  uint8_t activeInjectedButton = 0xFF; // Currently held virtual button, if any
-  bool wasConnected = false;           // Track if this device was previously connected for auto-reconnect
-  bool hasSeenRelease = false;         // Ignore startup noise until a release frame is seen
-  bool lastButtonState = false;        // Track button pressed state (from byte[0])
-  const DeviceProfiles::DeviceProfile* profile = nullptr;  // Device-specific HID profile
-  bool simpleFallbackEnabled = false;
-  uint8_t simpleForwardKeycode = 0x00;
-  uint8_t simpleBackKeycode = 0x00;
-  // Optional learned menu-action keycodes for clickers with more than two
-  // buttons. 0x00 means "not learned" — leave page-nav behavior unchanged.
-  uint8_t simpleConfirmKeycode = 0x00;
-  uint8_t simpleCancelKeycode = 0x00;
-  bool descriptorHasConsumerPage = false;
-  bool descriptorHasKeyboardPage = false;
-  uint8_t descriptorSuggestedIndex = 0xFF;
+
+  // Tracked for hadRecentRemoteInput() — feeds the reader's press-vs-release
+  // page-turn heuristic.
   unsigned long lastNormalizedEventMs = 0;
   uint8_t lastNormalizedKeycode = 0x00;
   bool lastNormalizedPressed = false;
-  uint8_t lastNormalizedDirection = 0xFF;  // 0x00=back, 0x01=forward, 0xFF=unknown
-  uint16_t lastGameBrickCounter = 0xFFFF;  // For counter-freeze detection (button vs joystick)
-  uint8_t lastGameBrickActiveKey = 0x00;   // Latched first key per freeze-window (prevents overshoot misfires)
-  uint8_t gameBrickCenterPressFrames = 0;  // Centered horizontal active-frame streak (LEFT fallback)
-  bool pendingGameBrickRelease = false;    // Delay short A/B release tails so one long hold stays merged
-  unsigned long pendingGameBrickReleaseMs = 0;
-  uint8_t pendingGameBrickKeycode = 0x00;
-  uint8_t pendingGameBrickButton = 0xFF;
 };
 
 class BluetoothHIDManager {
-public:
+ public:
   // Singleton access
   static BluetoothHIDManager& getInstance();
 
   static constexpr const char* ERROR_CONNECTION_FAILED = "BT_CONNECTION_FAILED";
   static constexpr const char* ERROR_CONNECTION_TIMEOUT = "BT_CONNECTION_TIMEOUT";
   static constexpr const char* ERROR_REMOTE_SLEEP_RETRY = "BT_REMOTE_SLEEP_RETRY";
+
+  // Boot-time preference: whether the BT controller's static DRAM (~30-40KB)
+  // is reserved at boot. Default is "released" — it saves DRAM for users who
+  // never pair a remote. Toggling this requires a reboot to take effect
+  // because esp_bt_controller_mem_release() is one-way: once Arduino's
+  // initArduino() releases the memory, esp_bt_controller_init() can't bring
+  // it back. The current process gets memory reserved only if it was
+  // reserved at the previous boot.
+  static bool isAvailableAtBoot();
+  static bool setAvailableAtBoot(bool value);
 
   // Lifecycle
   bool enable();
@@ -88,7 +102,10 @@ public:
   bool isConnected(const std::string& address) const;
   bool hasConnectedDevice() const;
   std::vector<ConnectedDevice> getConnectedDevicesCopy() const;
-  void refreshLearnedActionOverrides();
+  // Re-resolves the BleMappings::Set pointer on every connected device so
+  // freshly saved/cleared mappings take effect on the live connection,
+  // without waiting for a disconnect/reconnect cycle.
+  void refreshDeviceMappings();
 
   // Probe an advertised device to read its GATT Device Name (0x2A00) without
   // committing to a full HID connection. Updates the matching entry in
@@ -104,6 +121,10 @@ public:
                                 const uint8_t* raw, uint8_t rawLength);
   using ButtonInjectorCb = void (*)(void* ctx, uint8_t buttonIndex, bool pressed);
   using ReaderContextCb = bool (*)(void* ctx);
+  // Called on every BLE notify while a virtual button stays held by the same
+  // key, so HalGPIO can keep getHeldTime() pinned to BLE-observed activity
+  // rather than wall-clock. Without this, a BLE remote that drops release
+  // frames would let held-time grow unbounded between notifies.
   using ButtonActivityCb = void (*)(void* ctx, uint8_t buttonIndex);
 
   void processInputEvents();
@@ -123,7 +144,11 @@ public:
   // Check if BLE has had activity recently (within last 4 minutes)
   // Used by power manager to prevent sleep during BLE use
   bool hasRecentActivity() const;
-  bool hadRecentFree2Input(unsigned long windowMs = 1500) const;
+  // True if any connected BLE remote produced input in the last `windowMs`.
+  // Used by reader logic to prefer press-driven nav and disable long-press
+  // chapter skip when BLE remotes (which have unreliable release timing) are
+  // in use.
+  bool hadRecentRemoteInput(unsigned long windowMs = 1500) const;
 
   // Note: bonded-device persistence lives at the SETTINGS layer
   // (CrossPointSettings::bleBondedDevice*); this manager holds only the
@@ -137,18 +162,15 @@ public:
   void onClientDisconnected(const std::string& address, int reason);
   static void onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
 
-private:
+ private:
   BluetoothHIDManager();
   ~BluetoothHIDManager();
   BluetoothHIDManager(const BluetoothHIDManager&) = delete;
   BluetoothHIDManager& operator=(const BluetoothHIDManager&) = delete;
 
   void cleanup();
-  uint16_t parseHIDReport(uint8_t* data, size_t length);
   // Caller must hold _stateMutex while using the returned pointer.
   ConnectedDevice* findConnectedDevice(const std::string& address);
-  void applyLearnedActionOverrides(ConnectedDevice& device) const;
-  uint8_t mapKeycodeToButton(uint8_t keycode, ConnectedDevice* device);
 
   bool _enabled = false;
   bool _scanning = false;
@@ -178,7 +200,7 @@ private:
   unsigned long _lastDisconnectTime = 0;
 
   // Inactivity timeout (milliseconds)
-  static constexpr unsigned long INACTIVITY_TIMEOUT_MS = 300000;  // 5 minutes
+  static constexpr unsigned long INACTIVITY_TIMEOUT_MS = 300000;        // 5 minutes
   static constexpr unsigned long DISCONNECTED_IDLE_DISABLE_MS = 60000;  // 1 minute
   unsigned long lastMaintenanceCheck = 0;
   unsigned long disconnectedIdleSince = 0;

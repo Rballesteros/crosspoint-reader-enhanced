@@ -12,7 +12,7 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-constexpr uint8_t SECTION_FILE_VERSION = 23;
+constexpr uint8_t SECTION_FILE_VERSION = 24;
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
                                  sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) +
@@ -312,23 +312,59 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   return true;
 }
 
-std::unique_ptr<Page> Section::loadPageFromSectionFile() {
-  if (!Storage.openFileForRead("SCT", filePath, file)) {
+Section::Section(const std::shared_ptr<Epub>& epub, const int spineIndex, GfxRenderer& renderer)
+    : epub(epub),
+      spineIndex(spineIndex),
+      renderer(renderer),
+      filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".bin") {}
+
+Section::~Section() = default;
+
+std::unique_ptr<Page> Section::loadPageAtIndex(const int pageIndex) {
+  if (pageIndex < 0 || pageIndex >= pageCount) {
     return nullptr;
   }
-
-  file.seek(HEADER_SIZE - sizeof(uint32_t) * 4);
+  FsFile f;
+  if (!Storage.openFileForRead("SCT", filePath, f)) {
+    return nullptr;
+  }
+  f.seek(HEADER_SIZE - sizeof(uint32_t) * 4);
   uint32_t lutOffset;
-  serialization::readPod(file, lutOffset);
-  file.seek(lutOffset + sizeof(uint32_t) * currentPage);
+  serialization::readPod(f, lutOffset);
+  f.seek(lutOffset + sizeof(uint32_t) * pageIndex);
   uint32_t pagePos;
-  serialization::readPod(file, pagePos);
-  file.seek(pagePos);
+  serialization::readPod(f, pagePos);
+  f.seek(pagePos);
+  // Local FsFile auto-closes via DESTRUCTOR_CLOSES_FILE.
+  return Page::deserialize(f);
+}
 
-  auto page = Page::deserialize(file);
-  // Explicit close() required: member variable persists beyond function scope
-  file.close();
-  return page;
+std::unique_ptr<Page> Section::loadPageFromSectionFile() {
+  // Prefetch hit: hand over the cached page if it matches the requested index.
+  if (prefetchedPage && prefetchedPageIndex == currentPage) {
+    LOG_DBG("SCT", "prefetch hit pageIdx=%d", currentPage);
+    prefetchedPageIndex = -1;
+    return std::move(prefetchedPage);
+  }
+  return loadPageAtIndex(currentPage);
+}
+
+bool Section::prefetchNextPage() {
+  const int targetIndex = currentPage + 1;
+  if (targetIndex < 0 || targetIndex >= pageCount) {
+    return false;
+  }
+  if (prefetchedPage && prefetchedPageIndex == targetIndex) {
+    return true;  // already prefetched
+  }
+  auto page = loadPageAtIndex(targetIndex);
+  if (!page) {
+    return false;
+  }
+  prefetchedPage = std::move(page);
+  prefetchedPageIndex = targetIndex;
+  LOG_DBG("SCT", "prefetched pageIdx=%d", targetIndex);
+  return true;
 }
 
 std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) const {

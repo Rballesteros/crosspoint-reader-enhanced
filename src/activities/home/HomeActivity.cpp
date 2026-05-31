@@ -157,18 +157,17 @@ bool HomeActivity::storeCoverBuffer() {
   freeCoverBuffer();
 
   const size_t bufferSize = renderer.getBufferSize();
-  // Safety margin tuned so the cache engages when BT is loaded (NimBLE consumes ~50KB heap,
-  // leaving ~65KB free). Without the cache, all covers get re-decoded/scaled on every redraw,
-  // adding ~250ms per render. The cover decode has already happened by the time we get here,
-  // so the remaining heap pressure is just the next frame's incremental work.
-  constexpr size_t COVER_BUFFER_HEAP_SAFETY_MARGIN = 8 * 1024;
+  // Keep Home's speed cache opportunistic. When BLE and SD-card font caches
+  // have already narrowed the largest free block, preserving heap headroom is
+  // more important than avoiding a cover redraw from SD.
+  constexpr size_t COVER_BUFFER_HEAP_SAFETY_MARGIN = 32 * 1024;
   const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   const size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   const size_t requiredFree = bufferSize + COVER_BUFFER_HEAP_SAFETY_MARGIN;
   if (freeBefore < requiredFree || largestBefore < bufferSize) {
     LOG_DBG("HOME", "Skipping cover buffer store: free=%u maxAlloc=%u needFree=%u needChunk=%u",
-            static_cast<unsigned>(freeBefore), static_cast<unsigned>(largestBefore), static_cast<unsigned>(requiredFree),
-            static_cast<unsigned>(bufferSize));
+            static_cast<unsigned>(freeBefore), static_cast<unsigned>(largestBefore),
+            static_cast<unsigned>(requiredFree), static_cast<unsigned>(bufferSize));
     return false;
   }
 
@@ -305,8 +304,6 @@ void HomeActivity::render(RenderLock&&) {
     loadRecentCovers(metrics.homeCoverHeight);
   }
 }
-
-
 
 void HomeActivity::onFileBrowserOpen() { activityManager.goToFileBrowser(); }
 

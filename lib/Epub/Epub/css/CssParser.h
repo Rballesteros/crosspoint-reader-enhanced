@@ -10,6 +10,20 @@
 
 #include "CssStyle.h"
 
+struct CssSelectorHash {
+  using is_transparent = void;
+
+  size_t operator()(std::string_view value) const noexcept { return std::hash<std::string_view>{}(value); }
+  size_t operator()(const std::string& value) const noexcept { return (*this)(std::string_view(value)); }
+  size_t operator()(const char* value) const noexcept { return (*this)(std::string_view(value)); }
+};
+
+struct CssSelectorEqual {
+  using is_transparent = void;
+
+  bool operator()(std::string_view lhs, std::string_view rhs) const noexcept { return lhs == rhs; }
+};
+
 /**
  * Lightweight CSS parser for EPUB stylesheets
  *
@@ -106,7 +120,7 @@ class CssParser {
 
  private:
   // Storage: maps normalized selector -> style properties
-  std::unordered_map<std::string, CssStyle> rulesBySelector_;
+  std::unordered_map<std::string, CssStyle, CssSelectorHash, CssSelectorEqual> rulesBySelector_;
 
   std::string cachePath;
 

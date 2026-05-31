@@ -15,6 +15,24 @@ namespace ReaderUtils {
 constexpr unsigned long GO_HOME_MS = 1000;
 constexpr unsigned long SKIP_HOLD_MS = 700;
 
+// Deferred anti-aliasing "settle" tuning, shared by the EPUB and TXT readers.
+// During a rapid burst of page turns the grayscale pass is skipped and deferred
+// until the user idles, so bursts stay responsive. Defined here so both readers
+// stay in lockstep — diverging thresholds reintroduce the low-heap settle crash.
+//
+// If the previous page turn happened within RAPID_TURN_THRESHOLD_MS, the render
+// skips the grayscale pass. The settle then fires once input has been idle for
+// SETTLE_THRESHOLD_MS.
+constexpr unsigned long RAPID_TURN_THRESHOLD_MS = 600;
+constexpr unsigned long SETTLE_THRESHOLD_MS = 400;
+// Heap headroom required to enter the AA settle. The settle does a BW store +
+// grayscale renders; without this guard the fallback re-render can crash on a
+// fragmented heap (~50 KB free / ~33 KB max-alloc was the failing point). 80 KB
+// free covers the ~72 KB BW store + working headroom; the 12 KB block guard
+// keeps us above the 8 KB storeBwBuffer minimum with margin.
+constexpr size_t SETTLE_HEAP_GUARD_BYTES = 80 * 1024;
+constexpr size_t SETTLE_BLOCK_GUARD_BYTES = 12 * 1024;
+
 inline void applyOrientation(GfxRenderer& renderer, const uint8_t orientation) {
   switch (orientation) {
     case CrossPointSettings::ORIENTATION::PORTRAIT:
@@ -45,11 +63,10 @@ inline bool allowLongPressChapterSkip() {
   // makes release-driven page turns look ghostier than local buttons. Treat
   // recent BLE input as page-turn-only and keep chapter-skip semantics for the
   // local hardware buttons.
-  return SETTINGS.longPressButtonBehavior != SETTINGS.OFF &&
-         !BluetoothHIDManager::getInstance().hadRecentFree2Input();
+  return SETTINGS.longPressButtonBehavior != SETTINGS.OFF && !BluetoothHIDManager::getInstance().hadRecentRemoteInput();
 }
 
-inline bool preferPressForBleInput() { return BluetoothHIDManager::getInstance().hadRecentFree2Input(); }
+inline bool preferPressForBleInput() { return BluetoothHIDManager::getInstance().hadRecentRemoteInput(); }
 
 inline bool actionTriggered(const MappedInputManager& input, const MappedInputManager::Button button) {
   return preferPressForBleInput() ? input.wasPressed(button) : input.wasReleased(button);
@@ -73,8 +90,9 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
 }
 
 inline bool shouldStrengthenBleStatusCounterRefresh(int pagesUntilFullRefresh) {
-  return pagesUntilFullRefresh > 1 && (SETTINGS.statusBarChapterPageCount || SETTINGS.statusBarBookProgressPercentage) &&
-         BluetoothHIDManager::getInstance().hadRecentFree2Input();
+  return pagesUntilFullRefresh > 1 &&
+         (SETTINGS.statusBarChapterPageCount || SETTINGS.statusBarBookProgressPercentage) &&
+         BluetoothHIDManager::getInstance().hadRecentRemoteInput();
 }
 
 inline void refreshStatusBarCounterWindow(const GfxRenderer& renderer, float bookProgress, int currentPage,
@@ -142,14 +160,21 @@ inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntil
 }
 
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
-// the grayscale buffer. Only the content callback is re-rendered — status bars
-// and other overlays should be drawn before calling this.
-// Kept as a template to avoid std::function overhead; instantiated once per reader type.
-template <typename RenderFn>
-void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
-  if (!renderer.storeBwBuffer()) {
-    LOG_DBG("READER", "Skipping AA: BW buffer store failed");
-    return;
+// the grayscale buffer. If the BW framebuffer backup cannot be allocated, AA
+// still runs and the caller-provided restore callback rebuilds the normal BW
+// framebuffer afterward. Kept as templates to avoid std::function overhead.
+//
+// skipBwStore forces the re-render path: the ~48KB storeBwBuffer allocation is
+// skipped entirely and restoreBwFn rebuilds the BW frame at the end. Callers
+// running under heap pressure (e.g. the deferred-AA settle after a rapid burst)
+// use this — the store fragments the heap and the subsequent grayscale
+// page render then faults on a too-small contiguous block.
+template <typename RenderFn, typename RestoreBwFn>
+void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn, RestoreBwFn&& restoreBwFn,
+                       bool skipBwStore = false) {
+  const bool bwBufferStored = !skipBwStore && renderer.storeBwBuffer();
+  if (!bwBufferStored && !skipBwStore) {
+    LOG_DBG("READER", "BW buffer store failed; AA will use re-render fallback");
   }
 
   renderer.clearScreen(0x00);
@@ -165,7 +190,20 @@ void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
   renderer.displayGrayBuffer();
   renderer.setRenderMode(GfxRenderer::BW);
 
-  renderer.restoreBwBuffer();
+  if (bwBufferStored) {
+    renderer.restoreBwBuffer();
+    LOG_DBG("READER", "AA fast path: restored BW buffer");
+  } else {
+    renderer.clearScreen();
+    restoreBwFn();
+    renderer.cleanupGrayscaleWithFrameBuffer();
+    LOG_DBG("READER", "AA fallback: re-rendered BW buffer");
+  }
+}
+
+template <typename RenderFn>
+void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
+  renderAntiAliased(renderer, renderFn, renderFn);
 }
 
 }  // namespace ReaderUtils

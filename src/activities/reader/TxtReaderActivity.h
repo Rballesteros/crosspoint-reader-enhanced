@@ -2,6 +2,7 @@
 
 #include <Txt.h>
 
+#include <atomic>
 #include <vector>
 
 #include "CrossPointSettings.h"
@@ -21,6 +22,15 @@ class TxtReaderActivity final : public Activity {
   int viewportWidth = 0;
   bool initialized = false;
 
+  // Deferred AA settle — same shape as EpubReaderActivity. Skips grayscale during
+  // rapid bursts and settles once idle. currentPageLines stays valid across
+  // settles so we don't need a stashed page object.
+  unsigned long lastPageTurnTime = 0UL;
+  bool currentTurnIsRapid = false;
+  std::atomic<bool> aaSettlePending{false};
+  int pendingSettlePageIdx = -1;
+  bool settleAlreadyRequested = false;
+
   // Cached settings for cache validation (different fonts/margins require re-indexing)
   int cachedFontId = 0;
   uint8_t cachedScreenMargin = 0;
@@ -31,6 +41,12 @@ class TxtReaderActivity final : public Activity {
   int cachedOrientedMarginLeft = 0;
 
   void renderPage();
+  // Extracted from renderPage's local lambda so the deferred-AA settle path can
+  // re-render the same lines into the grayscale framebuffer.
+  void renderLinesIntoFramebuffer() const;
+  // Settle pass for deferred AA — runs only the grayscale render + display.
+  void renderAaSettle();
+  void clearAaSettle();
   void renderStatusBar() const;
 
   void initializeReader();

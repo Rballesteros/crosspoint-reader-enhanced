@@ -2,12 +2,12 @@
 
 #include <Arduino.h>
 #include <Logging.h>
-
 #include <esp_heap_caps.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <string_view>
 
 namespace {
@@ -43,10 +43,6 @@ constexpr size_t READ_BUFFER_SIZE = 512;
 // Prevents unbounded memory growth from pathological CSS files
 constexpr size_t MAX_RULES = 1500;
 
-// Minimum free heap required to apply CSS during rendering
-// If below this threshold, we skip CSS to avoid display artifacts.
-constexpr size_t MIN_FREE_HEAP_FOR_CSS = 48 * 1024;
-
 // Loading the CSS cache builds an unordered_map node for every selector. CSS is
 // optional, so skip it before fragmentation turns a failed allocation into an abort.
 constexpr size_t MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD = 40 * 1024;
@@ -80,6 +76,49 @@ bool hasCssHeapHeadroom(const size_t minFree, const size_t minLargest, HeapSnaps
     *snapshot = current;
   }
   return current.free >= minFree && current.largest >= minLargest;
+}
+
+std::string_view normalizedIntoBuffer(std::string_view s, char* out, const size_t outSize) {
+  if (outSize == 0) return {};
+
+  size_t len = 0;
+  bool inSpace = true;
+  for (const char c : s) {
+    if (isCssWhitespace(c)) {
+      if (!inSpace) {
+        if (len + 1 >= outSize) return {};
+        out[len++] = ' ';
+        inSpace = true;
+      }
+    } else {
+      if (len + 1 >= outSize) return {};
+      out[len++] = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      inSpace = false;
+    }
+  }
+
+  if (len > 0 && out[len - 1] == ' ') len--;
+  out[len] = '\0';
+  return {out, len};
+}
+
+std::string_view classSelectorIntoBuffer(std::string_view cls, char* out, const size_t outSize) {
+  if (outSize < 2) return {};
+  out[0] = '.';
+  const auto normalizedClass = normalizedIntoBuffer(cls, out + 1, outSize - 1);
+  if (normalizedClass.empty()) return {};
+  return {out, normalizedClass.size() + 1};
+}
+
+std::string_view combinedSelectorIntoBuffer(std::string_view tag, std::string_view cls, char* out,
+                                            const size_t outSize) {
+  if (tag.empty() || outSize < tag.size() + 2) return {};
+  memcpy(out, tag.data(), tag.size());
+  size_t len = tag.size();
+  out[len++] = '.';
+  const auto normalizedClass = normalizedIntoBuffer(cls, out + len, outSize - len);
+  if (normalizedClass.empty()) return {};
+  return {out, len + normalizedClass.size()};
 }
 
 std::string_view stripTrailingImportant(std::string_view value) {
@@ -423,10 +462,10 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
     if (key.empty()) continue;
 
     // Advanced Selector Support
-    // To support complex selectors like "div > p", "div + p", or "div ~ p", 
+    // To support complex selectors like "div > p", "div + p", or "div ~ p",
     // we isolate the right-most (target) element and apply the style to it.
     // While this applies the style broadly (ignoring the hierarchy constraint),
-    // it ensures that heavily stylized EPUBs do not completely lose formatting 
+    // it ensures that heavily stylized EPUBs do not completely lose formatting
     // for standard layout elements.
 
     size_t lastCombinator = key.find_last_of(">+~ ");
@@ -437,7 +476,7 @@ void CssParser::processRuleBlockWithStyle(std::string_view selectorGroup, const 
       while (targetStart < key.size() && isCssWhitespace(key[targetStart])) {
         targetStart++;
       }
-      
+
       if (targetStart < key.size()) {
         std::string targetElement = key.substr(targetStart);
         if (!targetElement.empty()) {
@@ -647,17 +686,19 @@ bool CssParser::loadFromStream(FsFile& source) {
 // Style resolution
 
 CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view classAttr) const {
-  static bool lowHeapWarningLogged = false;
-  if (ESP.getFreeHeap() < MIN_FREE_HEAP_FOR_CSS) {
-    if (!lowHeapWarningLogged) {
-      lowHeapWarningLogged = true;
-      LOG_DBG("CSS", "Warning: low heap (%u bytes) below MIN_FREE_HEAP_FOR_CSS (%u), returning empty style",
-              ESP.getFreeHeap(), static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS));
-    }
-    return CssStyle{};
-  }
   CssStyle result;
-  const std::string tag = normalized(tagName);
+
+  // Keep lookup allocation-free so low-heap BLE renders preserve book styling.
+  // Parsing/cache loading still have heap gates; resolving an already-loaded
+  // rule only needs short selector scratch buffers.
+  //
+  // The scratch buffers below are `static` rather than stack locals to keep
+  // this function inside the project's 256-byte-stack guideline. EPUB
+  // rendering is single-task on the ESP32-C3, so the buffers do not need
+  // any locking — but a future caller from another task would race.
+  static char tagBuf[MAX_SELECTOR_LENGTH + 1];
+  static char selectorBuf[MAX_SELECTOR_LENGTH + 1];
+  const std::string_view tag = normalizedIntoBuffer(tagName, tagBuf, sizeof(tagBuf));
 
   // 1. Apply element-level style (lowest priority)
   const auto tagIt = rulesBySelector_.find(tag);
@@ -665,14 +706,27 @@ CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view clas
     result.applyOver(tagIt->second);
   }
 
-  // TODO: Support combinations of classes (e.g. style on .class1.class2)
-  // 2. Apply class styles (medium priority)
   if (!classAttr.empty()) {
-    const auto classes = splitWhitespace(classAttr);
+    // Split the class attribute once into a small fixed-size array of views.
+    // Keeps the two-pass apply order below (all .cls rules, then all
+    // tag.cls rules) so a later .clsN can't accidentally override an
+    // earlier tag.clsM — which would invert CSS specificity.
+    constexpr size_t MAX_CLASSES = 16;
+    std::array<std::string_view, MAX_CLASSES> classes;
+    size_t classCount = 0;
+    size_t pos = 0;
+    while (pos < classAttr.size() && classCount < MAX_CLASSES) {
+      while (pos < classAttr.size() && isCssWhitespace(classAttr[pos])) pos++;
+      const size_t start = pos;
+      while (pos < classAttr.size() && !isCssWhitespace(classAttr[pos])) pos++;
+      if (start == pos) continue;
+      classes[classCount++] = classAttr.substr(start, pos - start);
+    }
 
-    for (const auto& cls : classes) {
-      std::string classKey = "." + normalized(cls);
-
+    // TODO: Support combinations of classes (e.g. style on .class1.class2)
+    // 2. Apply class styles (medium priority)
+    for (size_t i = 0; i < classCount; ++i) {
+      const std::string_view classKey = classSelectorIntoBuffer(classes[i], selectorBuf, sizeof(selectorBuf));
       auto classIt = rulesBySelector_.find(classKey);
       if (classIt != rulesBySelector_.end()) {
         result.applyOver(classIt->second);
@@ -681,9 +735,9 @@ CssStyle CssParser::resolveStyle(std::string_view tagName, std::string_view clas
 
     // TODO: Support combinations of classes (e.g. style on p.class1.class2)
     // 3. Apply element.class styles (higher priority)
-    for (const auto& cls : classes) {
-      std::string combinedKey = tag + "." + normalized(cls);
-
+    for (size_t i = 0; i < classCount; ++i) {
+      const std::string_view combinedKey =
+          combinedSelectorIntoBuffer(tag, classes[i], selectorBuf, sizeof(selectorBuf));
       auto combinedIt = rulesBySelector_.find(combinedKey);
       if (combinedIt != rulesBySelector_.end()) {
         result.applyOver(combinedIt->second);
@@ -823,8 +877,7 @@ bool CssParser::loadFromCache() {
   HeapSnapshot heapBefore;
   if (ruleCount > 0 &&
       !hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD, MIN_LARGEST_BLOCK_FOR_CSS_CACHE_LOAD, &heapBefore)) {
-    LOG_DBG("CSS",
-            "Skipping CSS cache load under low heap: rules=%u free=%u maxAlloc=%u needFree=%u needBlock=%u",
+    LOG_DBG("CSS", "Skipping CSS cache load under low heap: rules=%u free=%u maxAlloc=%u needFree=%u needBlock=%u",
             ruleCount, static_cast<unsigned>(heapBefore.free), static_cast<unsigned>(heapBefore.largest),
             static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS_CACHE_LOAD),
             static_cast<unsigned>(MIN_LARGEST_BLOCK_FOR_CSS_CACHE_LOAD));
@@ -848,11 +901,10 @@ bool CssParser::loadFromCache() {
   for (uint16_t i = 0; i < ruleCount; ++i) {
     if (i % CSS_CACHE_HEAP_CHECK_INTERVAL == 0) {
       HeapSnapshot heapDuring;
-      if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT,
-                              &heapDuring)) {
+      if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT, &heapDuring)) {
         LOG_DBG("CSS",
-                "Stopping CSS cache load under low heap: loaded=%u/%u free=%u maxAlloc=%u needFree=%u needBlock=%u",
-                i, ruleCount, static_cast<unsigned>(heapDuring.free), static_cast<unsigned>(heapDuring.largest),
+                "Stopping CSS cache load under low heap: loaded=%u/%u free=%u maxAlloc=%u needFree=%u needBlock=%u", i,
+                ruleCount, static_cast<unsigned>(heapDuring.free), static_cast<unsigned>(heapDuring.largest),
                 static_cast<unsigned>(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT),
                 static_cast<unsigned>(MIN_LARGEST_BLOCK_FOR_CSS_RULE_INSERT));
         rulesBySelector_.clear();
@@ -879,8 +931,7 @@ bool CssParser::loadFromCache() {
 
     HeapSnapshot heapForSelector;
     if (!hasCssHeapHeadroom(MIN_FREE_HEAP_FOR_CSS_RULE_INSERT, selectorLen + 128, &heapForSelector)) {
-      LOG_DBG("CSS",
-              "Stopping CSS cache load before selector allocation: loaded=%u/%u free=%u maxAlloc=%u selector=%u",
+      LOG_DBG("CSS", "Stopping CSS cache load before selector allocation: loaded=%u/%u free=%u maxAlloc=%u selector=%u",
               i, ruleCount, static_cast<unsigned>(heapForSelector.free), static_cast<unsigned>(heapForSelector.largest),
               selectorLen);
       rulesBySelector_.clear();

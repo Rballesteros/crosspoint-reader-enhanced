@@ -95,10 +95,13 @@ UIIcon UITheme::getFileIcon(const std::string& filename) {
 int UITheme::getStatusBarHeight() {
   const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
 
-  // Add status bar margin
+  // Add status bar margin. Use the reader-gated BT visibility so that
+  // statusBarBluetooth=0 lets the reader reclaim the 19px row when no other
+  // status bar items are enabled — even while BT is on (the top status bar
+  // still shows the icon unconditionally, but that's a separate code path).
   const bool showStatusBar = SETTINGS.statusBarChapterPageCount || SETTINGS.statusBarBookProgressPercentage ||
                              SETTINGS.statusBarTitle != CrossPointSettings::STATUS_BAR_TITLE::HIDE_TITLE ||
-                             SETTINGS.statusBarBattery || BaseTheme::showBluetoothStatusIndicator();
+                             SETTINGS.statusBarBattery || BaseTheme::showBluetoothStatusIndicatorInReader();
   const bool showProgressBar =
       SETTINGS.statusBarProgressBar != CrossPointSettings::STATUS_BAR_PROGRESS_BAR::HIDE_PROGRESS;
   return (showStatusBar ? (metrics.statusBarVerticalMargin) : 0) +

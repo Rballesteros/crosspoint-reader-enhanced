@@ -7,7 +7,6 @@
 #include <Logging.h>
 #include <PngToBmpConverter.h>
 #include <ZipFile.h>
-
 #include <esp_heap_caps.h>
 
 #include <algorithm>
@@ -788,7 +787,13 @@ int Epub::getSpineItemsCount() const {
   return bookMetadataCache->getSpineCount();
 }
 
-size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const { return getSpineItem(spineIndex).cumulativeSize; }
+size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const {
+  if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
+    LOG_ERR("EBP", "getCumulativeSpineItemSize called but cache not loaded");
+    return 0;
+  }
+  return bookMetadataCache->getSpineCumulativeSize(spineIndex);
+}
 
 BookMetadataCache::SpineEntry Epub::getSpineItem(const int spineIndex) const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
@@ -847,7 +852,13 @@ int Epub::getSpineIndexForTocIndex(const int tocIndex) const {
   return spineIndex;
 }
 
-int Epub::getTocIndexForSpineIndex(const int spineIndex) const { return getSpineItem(spineIndex).tocIndex; }
+int Epub::getTocIndexForSpineIndex(const int spineIndex) const {
+  if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
+    LOG_ERR("EBP", "getTocIndexForSpineIndex called but cache not loaded");
+    return -1;
+  }
+  return bookMetadataCache->getSpineTocIndex(spineIndex);
+}
 
 size_t Epub::getBookSize() const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded() || bookMetadataCache->getSpineCount() == 0) {
@@ -922,8 +933,9 @@ int Epub::resolveHrefToSpineIndex(std::string_view href) const {
     if (spineHref == target) return i;
     // Then filename-only match
     size_t spineSlash = spineHref.find_last_of('/');
-    std::string_view spineFilename =
-        (spineSlash != std::string::npos) ? std::string_view(spineHref).substr(spineSlash + 1) : std::string_view(spineHref);
+    std::string_view spineFilename = (spineSlash != std::string::npos)
+                                         ? std::string_view(spineHref).substr(spineSlash + 1)
+                                         : std::string_view(spineHref);
     if (spineFilename == targetFilename) return i;
   }
   return -1;

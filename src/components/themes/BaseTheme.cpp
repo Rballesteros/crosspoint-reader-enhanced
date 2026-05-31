@@ -50,8 +50,25 @@ void BaseTheme::drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX,
 }
 
 bool BaseTheme::showBluetoothStatusIndicator() {
+  // Top status bar (drawHeader): always show whenever BT is on, regardless of
+  // the Customize Status Bar toggle. The toggle only governs the reader
+  // status bar — see showBluetoothStatusIndicatorInReader().
   auto& btMgr = BluetoothHIDManager::getInstance();
-  return SETTINGS.bluetoothEnabled || btMgr.isEnabled() || btMgr.hasConnectedDevice();
+  // SETTINGS.bluetoothEnabled is the persisted *preference*, not the live radio
+  // state. It only implies BT is actually usable this session if the controller
+  // memory was reserved at boot; if it was released, enable() is refused and the
+  // radio never comes up — showing the icon then is stale (it appears "on" while
+  // BT is off). Gate the preference on the boot reservation, and otherwise defer
+  // to the live radio/connection state.
+  const bool prefImpliesActive = SETTINGS.bluetoothEnabled && BluetoothHIDManager::isAvailableAtBoot();
+  return prefImpliesActive || btMgr.isEnabled() || btMgr.hasConnectedDevice();
+}
+
+bool BaseTheme::showBluetoothStatusIndicatorInReader() {
+  if (!SETTINGS.statusBarBluetooth) {
+    return false;
+  }
+  return showBluetoothStatusIndicator();
 }
 
 bool BaseTheme::isBluetoothStatusConnected() { return BluetoothHIDManager::getInstance().hasConnectedDevice(); }
@@ -790,8 +807,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   const int leftStatusX = metrics.statusBarHorizontalMargin + orientedMarginLeft + 1;
   int leftStatusWidth = 0;
   if (SETTINGS.statusBarBattery) {
-    GUI.drawBatteryLeft(renderer,
-                        Rect{leftStatusX, textY, metrics.batteryWidth, metrics.batteryHeight},
+    GUI.drawBatteryLeft(renderer, Rect{leftStatusX, textY, metrics.batteryWidth, metrics.batteryHeight},
                         showBatteryPercentage);
     leftStatusWidth = metrics.batteryWidth;
     if (showBatteryPercentage) {
@@ -800,7 +816,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     }
   }
 
-  if (showBluetoothStatusIndicator()) {
+  if (showBluetoothStatusIndicatorInReader()) {
     const int iconX = leftStatusX + leftStatusWidth + (leftStatusWidth > 0 ? bluetoothStatusSpacing : 0);
     const int iconY = textY + 6 + (metrics.batteryHeight - bluetoothStatusHeight) / 2;
     drawBluetoothStatusIcon(renderer, iconX, iconY, isBluetoothStatusConnected());

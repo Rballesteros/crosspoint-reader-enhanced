@@ -116,6 +116,11 @@ time_data: deque[str] = deque(maxlen=MAX_POINTS)
 free_mem_data: deque[float] = deque(maxlen=MAX_POINTS)
 total_mem_data: deque[float] = deque(maxlen=MAX_POINTS)
 max_alloc_data: deque[float] = deque(maxlen=MAX_POINTS)
+free_blocks_data: deque[int] = deque(maxlen=MAX_POINTS)
+
+# Emergency fragmentation threshold (bytes) — must match src/main.cpp:409.
+# When MaxAlloc drops below this, the firmware flushes the font cache.
+MAX_ALLOC_WARNING_BYTES = 8192
 data_lock: threading.Lock = threading.Lock()  # Prevent reading while writing
 
 # Global shutdown flag
@@ -127,7 +132,7 @@ init(autoreset=True)
 # Color mapping for log lines
 COLOR_KEYWORDS: dict[str, list[str]] = {
     Fore.RED: ["ERROR", "[ERR]", "[SCT]", "FAILED", "WARNING"],
-    Fore.CYAN: ["[MEM]", "FREE:"],
+    Fore.CYAN: ["[MEM ", "FREE:"],
     Fore.MAGENTA: [
         "[GFX]",
         "[ERS]",
@@ -210,11 +215,12 @@ def get_color_for_line(line: str) -> str:
     return Fore.WHITE
 
 
-def parse_memory_line(line: str) -> tuple[int | None, int | None, int | None]:
+def parse_memory_line(line: str) -> tuple[int | None, int | None, int | None, int | None]:
     """
     Extracts memory stats from MEM log lines.
-    Format: Free: N bytes, Total: N bytes, Min Free: N bytes, MaxAlloc: N bytes
-    Returns: (free_bytes, total_bytes, max_alloc_bytes)
+    Firmware format (src/main.cpp:400):
+      Free: N, MaxAlloc: N, Blocks: N | Stack: UI:N, Render:N
+    Returns: (free_bytes, total_bytes, max_alloc_bytes, free_blocks)
     """
     def _find(pattern: str) -> int | None:
         m = re.search(pattern, line)
@@ -229,6 +235,7 @@ def parse_memory_line(line: str) -> tuple[int | None, int | None, int | None]:
         _find(r"\bFree:\s*(\d+)"),
         _find(r"\bTotal:\s*(\d+)"),
         _find(r"\bMaxAlloc:\s*(\d+)"),
+        _find(r"\bBlocks:\s*(\d+)"),
     )
 
 
@@ -306,15 +313,22 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
                     pc_time = datetime.now().strftime("%H:%M:%S")
                     formatted_line = re.sub(r"^\[\d+\]", f"[{pc_time}]", clean_line)
 
-                    # Check for Memory Line
-                    if "[MEM]" in formatted_line:
-                        free_val, total_val, max_alloc_val = parse_memory_line(formatted_line)
-                        if free_val is not None and total_val is not None:
+                    # Check for Memory Line. Firmware pads the origin field to
+                    # 4 chars with "%-4s" (Logging.cpp), so "MEM" emits as
+                    # "[MEM ]" with a trailing space inside the brackets.
+                    if "[MEM ]" in formatted_line or "[MEM " in formatted_line:
+                        free_val, total_val, max_alloc_val, blocks_val = parse_memory_line(formatted_line)
+                        if free_val is not None:
+                            # Firmware MEM line carries Free + MaxAlloc but not Total.
+                            # Fall back to the ESP32-C3 DRAM ceiling so the Total line
+                            # still renders as a reference baseline.
+                            total_kb = (total_val / 1024) if total_val is not None else 320.0
                             with data_lock:
                                 time_data.append(pc_time)
                                 free_mem_data.append(free_val / 1024)
-                                total_mem_data.append(total_val / 1024)
+                                total_mem_data.append(total_kb)
                                 max_alloc_data.append((max_alloc_val or 0) / 1024)
+                                free_blocks_data.append(blocks_val or 0)
                     # Apply filters
                     if filter_keyword and filter_keyword not in formatted_line.lower():
                         continue
@@ -366,8 +380,8 @@ def update_graph(frame) -> list:  # pylint: disable=unused-argument
         x = list(time_data)
         y_free = list(free_mem_data)
         y_total = list(total_mem_data)
-        y_min_free = list(min_free_mem_data)
         y_max_alloc = list(max_alloc_data)
+        y_blocks = list(free_blocks_data)
 
     fig = plt.gcf()
     fig.clf()
@@ -375,17 +389,34 @@ def update_graph(frame) -> list:  # pylint: disable=unused-argument
 
     ax1.plot(x, y_total, label="Total RAM (KB)", color="red", linestyle="--")
     ax1.plot(x, y_free, label="Free RAM (KB)", color="green", marker="o", markersize=3)
-    if any(v > 0 for v in y_min_free):
-        ax1.plot(x, y_min_free, label="Min Free (KB)", color="blue", linestyle=":")
     if any(v > 0 for v in y_max_alloc):
         ax1.plot(x, y_max_alloc, label="Max Alloc (KB)", color="orange", linestyle="-.")
+        # Fragmentation cliff: matches the firmware's emergency flush threshold
+        # at src/main.cpp:409. When MaxAlloc dips under this line, the next large
+        # allocation (e.g., storeBwBuffer during AA settle) is at risk.
+        warn_kb = MAX_ALLOC_WARNING_BYTES / 1024
+        ax1.axhline(warn_kb, color="red", linestyle=":", linewidth=1, alpha=0.7,
+                    label=f"MaxAlloc warn ({warn_kb:.0f} KB)")
     ax1.fill_between(x, y_free, color="green", alpha=0.1)
     ax1.set_title("ESP32 Memory Monitor")
     ax1.set_ylabel("Memory (KB)")
     ax1.set_xlabel("Time")
-    ax1.legend(loc="upper left")
     ax1.grid(True, linestyle=":", alpha=0.6)
     plt.setp(ax1.get_xticklabels(), rotation=45, ha="right")
+
+    # Second axis for the fragmentation indicator: number of free blocks.
+    # High Free + low MaxAlloc + rising block count = fragmented heap.
+    if any(v > 0 for v in y_blocks):
+        ax2 = ax1.twinx()
+        ax2.plot(x, y_blocks, label="Free blocks", color="purple",
+                 linestyle="-", linewidth=1, alpha=0.6)
+        ax2.set_ylabel("Free blocks (count)", color="purple")
+        ax2.tick_params(axis="y", labelcolor="purple")
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+    else:
+        ax1.legend(loc="upper left")
 
     fig.tight_layout()
     return []

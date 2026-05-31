@@ -45,10 +45,12 @@ class InflateReader {
   InflateReader(const InflateReader&) = delete;
   InflateReader& operator=(const InflateReader&) = delete;
 
+  static constexpr size_t DEFAULT_STREAM_SAFETY_MARGIN = 16 * 1024;
+
   // Initialise decompressor. streaming=true allocates a ring buffer of dictSize
   // (defaults to 32KB) needed when read() or readAtMost() will be called multiple times.
   // Returns false only in streaming mode if the ring buffer allocation fails.
-  bool init(bool streaming = false, size_t dictSize = 0);
+  bool init(bool streaming = false, size_t dictSize = 0, size_t safetyMargin = DEFAULT_STREAM_SAFETY_MARGIN);
   // Release the ring buffer and reset internal state.
   void deinit();
 

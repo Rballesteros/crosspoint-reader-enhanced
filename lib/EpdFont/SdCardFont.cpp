@@ -1025,13 +1025,24 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
   unsigned long startMs = millis();
 
   // Step 1: Extract unique codepoints, capped at MAX_UNIQUE_CODEPOINTS.
-  // The dedup buffer is sized to the cap, not total chars — a large EPUB section
-  // may contain 50K+ characters but real text has far fewer unique codepoints.
-  // 4096 × 4 bytes = 16KB temporary; bounded regardless of input size.
+  // Size the dedup buffer to the current paragraph instead of always reserving
+  // the full cap. Most paragraphs only need tens of entries; the old fixed
+  // 4096-entry buffer cost 16KB transient heap per advance-table pass.
   static constexpr uint32_t MAX_UNIQUE_CODEPOINTS = 4096;
-  uint32_t* codepoints = new (std::nothrow) uint32_t[MAX_UNIQUE_CODEPOINTS];
+  uint32_t textCodepointCount = 0;
+  const unsigned char* countPtr = reinterpret_cast<const unsigned char*>(utf8Text);
+  while (*countPtr && textCodepointCount < MAX_UNIQUE_CODEPOINTS) {
+    if (utf8NextCodepoint(&countPtr) == 0) break;
+    textCodepointCount++;
+  }
+  if (textCodepointCount == 0) {
+    return 0;
+  }
+
+  const uint32_t codepointCapacity = std::min(textCodepointCount, MAX_UNIQUE_CODEPOINTS);
+  std::unique_ptr<uint32_t[]> codepoints(new (std::nothrow) uint32_t[codepointCapacity]);
   if (!codepoints) {
-    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", MAX_UNIQUE_CODEPOINTS * 4);
+    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", codepointCapacity * 4);
     return -1;
   }
   uint32_t cpCount = 0;
@@ -1054,7 +1065,7 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
       }
     }
     if (!found) {
-      if (cpCount >= MAX_UNIQUE_CODEPOINTS) {
+      if (cpCount >= codepointCapacity) {
         hitCap = true;
         break;
       }
@@ -1062,12 +1073,11 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
     }
   }
   if (hitCap) {
-    LOG_ERR("SDCF", "buildAdvanceTable: unique codepoint cap (%u) hit, layout may be approximate",
-            MAX_UNIQUE_CODEPOINTS);
+    LOG_ERR("SDCF", "buildAdvanceTable: unique codepoint cap (%u) hit, layout may be approximate", codepointCapacity);
   }
 
   // Sort for ordered glyph index mapping and final table output
-  std::sort(codepoints, codepoints + cpCount);
+  std::sort(codepoints.get(), codepoints.get() + cpCount);
 
   // Step 2: For each requested style, fetch any codepoints not yet cached and
   // merge them into the persistent advance table.
@@ -1164,8 +1174,6 @@ int SdCardFont::buildAdvanceTable(const char* utf8Text, uint8_t styleMask) {
     LOG_DBG("SDCF", "Advance table style %u: +%u from SD, total=%u/%u", si, fetched, advanceTableSize_[si],
             ADVANCE_CACHE_LIMIT);
   }
-
-  delete[] codepoints;
 
   stats_.prewarmTotalMs = millis() - startMs;
   return totalMissed;

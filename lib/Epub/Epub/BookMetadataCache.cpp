@@ -13,6 +13,15 @@ constexpr uint8_t BOOK_CACHE_VERSION = 5;
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
+constexpr uint32_t MAX_SPINE_HREF_BYTES = 2048;
+
+bool readU32(FsFile& file, uint32_t& value) {
+  return file.read(reinterpret_cast<uint8_t*>(&value), sizeof(value)) == static_cast<int>(sizeof(value));
+}
+
+bool readI16(FsFile& file, int16_t& value) {
+  return file.read(reinterpret_cast<uint8_t*>(&value), sizeof(value)) == static_cast<int>(sizeof(value));
+}
 }  // namespace
 
 /* ============= WRITING / BUILDING FUNCTIONS ================ */
@@ -406,11 +415,11 @@ bool BookMetadataCache::load() {
       uint32_t spineEntryPos;
       serialization::readPod(bookFile, spineEntryPos);
       bookFile.seek(spineEntryPos);
-      
+
       // We only need the href for the index
       std::string href;
       serialization::readString(bookFile, href);
-      
+
       spineHrefIndex.push_back({fnvHash64(href), static_cast<uint16_t>(href.length()), static_cast<int16_t>(i)});
     }
 
@@ -432,10 +441,11 @@ int16_t BookMetadataCache::getSpineIndexForHref(std::string_view href) const {
   uint64_t targetHash = fnvHash64(href);
   uint16_t targetLen = static_cast<uint16_t>(href.size());
 
-  auto it = std::lower_bound(spineHrefIndex.begin(), spineHrefIndex.end(), SpineHrefIndexEntry{targetHash, targetLen, 0},
-                             [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
-                               return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
-                             });
+  auto it =
+      std::lower_bound(spineHrefIndex.begin(), spineHrefIndex.end(), SpineHrefIndexEntry{targetHash, targetLen, 0},
+                       [](const SpineHrefIndexEntry& a, const SpineHrefIndexEntry& b) {
+                         return a.hrefHash < b.hrefHash || (a.hrefHash == b.hrefHash && a.hrefLen < b.hrefLen);
+                       });
 
   if (it != spineHrefIndex.end() && it->hrefHash == targetHash && it->hrefLen == targetLen) {
     return it->spineIndex;
@@ -461,6 +471,86 @@ BookMetadataCache::SpineEntry BookMetadataCache::getSpineEntry(const int index) 
   serialization::readPod(bookFile, spineEntryPos);
   bookFile.seek(spineEntryPos);
   return readSpineEntry(bookFile);
+}
+
+uint32_t BookMetadataCache::getSpineCumulativeSize(const int index) {
+  if (!loaded) {
+    LOG_ERR("BMC", "getSpineCumulativeSize called but cache not loaded");
+    return 0;
+  }
+
+  if (index < 0 || index >= static_cast<int>(spineCount)) {
+    LOG_ERR("BMC", "getSpineCumulativeSize index %d out of range", index);
+    return 0;
+  }
+
+  if (!bookFile.seekSet(lutOffset + sizeof(uint32_t) * index)) {
+    LOG_ERR("BMC", "Failed to seek spine LUT entry %d", index);
+    return 0;
+  }
+
+  uint32_t spineEntryPos = 0;
+  if (!readU32(bookFile, spineEntryPos) || !bookFile.seekSet(spineEntryPos)) {
+    LOG_ERR("BMC", "Failed to seek spine entry %d", index);
+    return 0;
+  }
+
+  uint32_t hrefLen = 0;
+  if (!readU32(bookFile, hrefLen) || hrefLen > MAX_SPINE_HREF_BYTES) {
+    LOG_ERR("BMC", "Invalid spine href length %u at index %d", static_cast<unsigned>(hrefLen), index);
+    return 0;
+  }
+  if (!bookFile.seekCur(hrefLen)) {
+    LOG_ERR("BMC", "Failed to skip spine href at index %d", index);
+    return 0;
+  }
+
+  uint32_t cumulativeSize = 0;
+  if (!readU32(bookFile, cumulativeSize)) {
+    LOG_ERR("BMC", "Failed to read cumulative size at index %d", index);
+    return 0;
+  }
+  return cumulativeSize;
+}
+
+int16_t BookMetadataCache::getSpineTocIndex(const int index) {
+  if (!loaded) {
+    LOG_ERR("BMC", "getSpineTocIndex called but cache not loaded");
+    return -1;
+  }
+
+  if (index < 0 || index >= static_cast<int>(spineCount)) {
+    LOG_ERR("BMC", "getSpineTocIndex index %d out of range", index);
+    return -1;
+  }
+
+  if (!bookFile.seekSet(lutOffset + sizeof(uint32_t) * index)) {
+    LOG_ERR("BMC", "Failed to seek spine LUT entry %d", index);
+    return -1;
+  }
+
+  uint32_t spineEntryPos = 0;
+  if (!readU32(bookFile, spineEntryPos) || !bookFile.seekSet(spineEntryPos)) {
+    LOG_ERR("BMC", "Failed to seek spine entry %d", index);
+    return -1;
+  }
+
+  uint32_t hrefLen = 0;
+  if (!readU32(bookFile, hrefLen) || hrefLen > MAX_SPINE_HREF_BYTES) {
+    LOG_ERR("BMC", "Invalid spine href length %u at index %d", static_cast<unsigned>(hrefLen), index);
+    return -1;
+  }
+  if (!bookFile.seekCur(hrefLen + sizeof(uint32_t))) {
+    LOG_ERR("BMC", "Failed to skip spine href/cumulative size at index %d", index);
+    return -1;
+  }
+
+  int16_t tocIndex = -1;
+  if (!readI16(bookFile, tocIndex)) {
+    LOG_ERR("BMC", "Failed to read toc index at spine %d", index);
+    return -1;
+  }
+  return tocIndex;
 }
 
 BookMetadataCache::TocEntry BookMetadataCache::getTocEntry(const int index) {

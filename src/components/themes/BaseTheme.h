@@ -171,7 +171,11 @@ class BaseTheme {
   static constexpr int bluetoothStatusSpacing = 6;
   static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight);
   static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY);
+  // Top status bar (drawHeader): always on whenever BT is on.
   static bool showBluetoothStatusIndicator();
+  // Reader status bar: also gated by SETTINGS.statusBarBluetooth so the user
+  // can hide it from the reading view via Customize Status Bar.
+  static bool showBluetoothStatusIndicatorInReader();
   static bool isBluetoothStatusConnected();
   static void drawBluetoothStatusIcon(const GfxRenderer& renderer, int x, int y, bool connected);
 };

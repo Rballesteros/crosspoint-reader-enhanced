@@ -232,6 +232,18 @@ void setup() {
 
   HalSystem::checkPanic();
 
+  // One-shot cleanup: pre-Phase-3 BLE remote learning persisted to two
+  // separate files. Phase 3 unified everything into ble_mappings.txt. Drop
+  // the stale files so they don't linger on user SD cards. Guarded by
+  // Storage.exists() so post-migration boots don't hit the SD for the
+  // remove call.
+  if (Storage.exists("/.crosspoint/ble_custom_profile.txt")) {
+    Storage.remove("/.crosspoint/ble_custom_profile.txt");
+  }
+  if (Storage.exists("/.crosspoint/ble_device_profiles.txt")) {
+    Storage.remove("/.crosspoint/ble_device_profiles.txt");
+  }
+
   SETTINGS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
@@ -242,11 +254,10 @@ void setup() {
   auto& btMgr = BluetoothHIDManager::getInstance();
   btMgr.setButtonInjector(
       [](void*, uint8_t buttonIndex, bool pressed) { gpio.setVirtualButtonState(buttonIndex, pressed); }, nullptr);
-  btMgr.setButtonActivityNotifier(
-      [](void*, uint8_t buttonIndex) { gpio.updateVirtualButtonActivity(buttonIndex); }, nullptr);
+  btMgr.setButtonActivityNotifier([](void*, uint8_t buttonIndex) { gpio.updateVirtualButtonActivity(buttonIndex); },
+                                  nullptr);
   btMgr.setReaderContextCallback([](void*) { return gBluetoothReaderContext; }, nullptr);
-  btMgr.setBondedDevice(SETTINGS.bleBondedDeviceAddr, SETTINGS.bleBondedDeviceName,
-                        SETTINGS.bleBondedDeviceAddrType);
+  btMgr.setBondedDevice(SETTINGS.bleBondedDeviceAddr, SETTINGS.bleBondedDeviceName, SETTINGS.bleBondedDeviceAddrType);
   LOG_INF("MAIN", "Bluetooth HID initialized with button injection");
 
   const auto wakeupReason = gpio.getWakeupReason();
@@ -359,7 +370,7 @@ void loop() {
   // wizards) may enable BT without flipping SETTINGS, and tearing them down would break them.
   if (SETTINGS.bluetoothEnabled || btMgr.isEnabled()) {
     if (SETTINGS.bluetoothEnabled && gBluetoothReaderContext && userInputDetected && !btMgr.isEnabled() &&
-        SETTINGS.bleBondedDeviceAddr[0] != '\0') {
+        BluetoothHIDManager::isAvailableAtBoot() && SETTINGS.bleBondedDeviceAddr[0] != '\0') {
       LOG_INF("BT", "Local input detected; waking Bluetooth for bonded-device reconnect");
       btMgr.enable();
     }
@@ -387,10 +398,8 @@ void loop() {
     heap_caps_get_info(&info, MALLOC_CAP_8BIT);
 
     LOG_INF("MEM", "Free: %d, MaxAlloc: %d, Blocks: %d | Stack: UI:%u, Render:%u",
-            static_cast<int>(info.total_free_bytes),
-            static_cast<int>(info.largest_free_block),
-            static_cast<int>(info.free_blocks),
-            static_cast<unsigned>(uiStack), static_cast<unsigned>(renderStack));
+            static_cast<int>(info.total_free_bytes), static_cast<int>(info.largest_free_block),
+            static_cast<int>(info.free_blocks), static_cast<unsigned>(uiStack), static_cast<unsigned>(renderStack));
 
     lastMemPrint = millis();
     recordHeapSample();

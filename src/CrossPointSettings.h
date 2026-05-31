@@ -168,6 +168,11 @@ class CrossPointSettings {
   uint8_t statusBarProgressBarThickness = PROGRESS_BAR_NORMAL;
   uint8_t statusBarTitle = CHAPTER_TITLE;
   uint8_t statusBarBattery = 1;
+  // Bluetooth status indicator visibility *inside the reader status bar*.
+  // The top status bar (drawHeader) is unconditional on this — it always
+  // shows the BT icon when BT is on. Defaults to 0 so the reading view stays
+  // uncluttered; the user can opt in via Customize Status Bar.
+  uint8_t statusBarBluetooth = 0;
   uint8_t xtcStatusBarMode = XTC_STATUS_BAR_HIDE;
   // Text rendering settings
   uint8_t extraParagraphSpacing = 1;
@@ -266,50 +271,31 @@ class CrossPointSettings {
   int getRefreshFrequency() const;
 
   bool operator==(const CrossPointSettings& other) const {
-    return sleepScreen == other.sleepScreen &&
-           sleepScreenCoverMode == other.sleepScreenCoverMode &&
-           sleepScreenCoverFilter == other.sleepScreenCoverFilter &&
-           statusBar == other.statusBar &&
+    return sleepScreen == other.sleepScreen && sleepScreenCoverMode == other.sleepScreenCoverMode &&
+           sleepScreenCoverFilter == other.sleepScreenCoverFilter && statusBar == other.statusBar &&
            statusBarChapterPageCount == other.statusBarChapterPageCount &&
            statusBarBookProgressPercentage == other.statusBarBookProgressPercentage &&
            statusBarProgressBar == other.statusBarProgressBar &&
            statusBarProgressBarThickness == other.statusBarProgressBarThickness &&
-           statusBarTitle == other.statusBarTitle &&
-           statusBarBattery == other.statusBarBattery &&
-           extraParagraphSpacing == other.extraParagraphSpacing &&
-           textAntiAliasing == other.textAntiAliasing &&
-           shortPwrBtn == other.shortPwrBtn &&
-           orientation == other.orientation &&
-           frontButtonLayout == other.frontButtonLayout &&
-           sideButtonLayout == other.sideButtonLayout &&
-           frontButtonBack == other.frontButtonBack &&
-           frontButtonConfirm == other.frontButtonConfirm &&
-           frontButtonLeft == other.frontButtonLeft &&
-           frontButtonRight == other.frontButtonRight &&
-           fontFamily == other.fontFamily &&
-           fontSize == other.fontSize &&
-           lineSpacing == other.lineSpacing &&
-           paragraphAlignment == other.paragraphAlignment &&
-           sleepTimeout == other.sleepTimeout &&
-           refreshFrequency == other.refreshFrequency &&
-           hyphenationEnabled == other.hyphenationEnabled &&
-           screenMargin == other.screenMargin &&
-           strcmp(opdsServerUrl, other.opdsServerUrl) == 0 &&
-           strcmp(opdsUsername, other.opdsUsername) == 0 &&
-           strcmp(opdsPassword, other.opdsPassword) == 0 &&
-           hideBatteryPercentage == other.hideBatteryPercentage &&
-           longPressButtonBehavior == other.longPressButtonBehavior &&
-           uiTheme == other.uiTheme &&
-           fadingFix == other.fadingFix &&
-           embeddedStyle == other.embeddedStyle &&
-           showHiddenFiles == other.showHiddenFiles &&
-           bluetoothEnabled == other.bluetoothEnabled &&
+           statusBarTitle == other.statusBarTitle && statusBarBattery == other.statusBarBattery &&
+           statusBarBluetooth == other.statusBarBluetooth && extraParagraphSpacing == other.extraParagraphSpacing &&
+           textAntiAliasing == other.textAntiAliasing && shortPwrBtn == other.shortPwrBtn &&
+           orientation == other.orientation && frontButtonLayout == other.frontButtonLayout &&
+           sideButtonLayout == other.sideButtonLayout && frontButtonBack == other.frontButtonBack &&
+           frontButtonConfirm == other.frontButtonConfirm && frontButtonLeft == other.frontButtonLeft &&
+           frontButtonRight == other.frontButtonRight && fontFamily == other.fontFamily && fontSize == other.fontSize &&
+           lineSpacing == other.lineSpacing && paragraphAlignment == other.paragraphAlignment &&
+           sleepTimeout == other.sleepTimeout && refreshFrequency == other.refreshFrequency &&
+           hyphenationEnabled == other.hyphenationEnabled && screenMargin == other.screenMargin &&
+           strcmp(opdsServerUrl, other.opdsServerUrl) == 0 && strcmp(opdsUsername, other.opdsUsername) == 0 &&
+           strcmp(opdsPassword, other.opdsPassword) == 0 && hideBatteryPercentage == other.hideBatteryPercentage &&
+           longPressButtonBehavior == other.longPressButtonBehavior && uiTheme == other.uiTheme &&
+           fadingFix == other.fadingFix && embeddedStyle == other.embeddedStyle &&
+           showHiddenFiles == other.showHiddenFiles && bluetoothEnabled == other.bluetoothEnabled &&
            strcmp(bleBondedDeviceAddr, other.bleBondedDeviceAddr) == 0 &&
            strcmp(bleBondedDeviceName, other.bleBondedDeviceName) == 0 &&
-           bleBondedDeviceAddrType == other.bleBondedDeviceAddrType &&
-           imageRendering == other.imageRendering &&
-           tiltPageTurn == other.tiltPageTurn &&
-           language == other.language;
+           bleBondedDeviceAddrType == other.bleBondedDeviceAddrType && imageRendering == other.imageRendering &&
+           tiltPageTurn == other.tiltPageTurn && language == other.language;
   }
 
   bool operator!=(const CrossPointSettings& other) const { return !(*this == other); }
