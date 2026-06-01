@@ -43,13 +43,6 @@ namespace {
 // pages per minute, first item is 1 to prevent division by zero if accessed
 constexpr int PAGE_TURN_RATES[] = {1, 1, 3, 6, 12};
 
-// Deferred-AA settle tuning (RAPID_TURN_THRESHOLD_MS, SETTLE_THRESHOLD_MS,
-// SETTLE_HEAP_GUARD_BYTES, SETTLE_BLOCK_GUARD_BYTES) is shared with the TXT
-// reader and lives in ReaderUtils so the two stay in lockstep.
-
-// Idle window before idle next-Page prefetch fires.
-constexpr unsigned long PREFETCH_IDLE_MS = 1500;
-
 int clampPercent(int percent) {
   if (percent < 0) {
     return 0;
@@ -176,7 +169,6 @@ void EpubReaderActivity::onExit() {
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
   chapterSkipConsumedForHold = false;
-  clearAaSettle();
   section.reset();
   if (pendingReadFolderMove && epub) {
     const std::string srcPath = epub->getPath();
@@ -729,20 +721,7 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
     return;
   }
 
-  // Detect burst: if the previous page turn happened within RAPID_TURN_THRESHOLD_MS,
-  // renderContents will skip the grayscale pass and defer it to a settle render.
-  //
-  // Only defer when a BLE remote is actually driving input. The deferral exists
-  // for BLE: remotes fire turns faster than a grayscale pass renders, and an
-  // active BT stack eats heap. With local buttons (BT off, or BT on but not the
-  // input source) there's no such pressure, so render AA inline immediately —
-  // crisper, and the whole deferred-settle machinery never runs.
   const auto now = millis();
-  const bool bleDrivingInput = BluetoothHIDManager::getInstance().hadRecentRemoteInput();
-  currentTurnIsRapid =
-      bleDrivingInput && (lastPageTurnTime != 0) && (now - lastPageTurnTime < ReaderUtils::RAPID_TURN_THRESHOLD_MS);
-  // Any deferred-AA settle from the previous page is now stale.
-  clearAaSettle();
 
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
@@ -777,23 +756,6 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
 void EpubReaderActivity::render(RenderLock&& lock) {
   if (!epub) {
     return;
-  }
-
-  // Deferred-AA settle path: if loop() requested a settle and the deferred page is
-  // still on screen (same section, same page index), run only the grayscale pass.
-  // Otherwise drop the stale stash and fall through to a normal render.
-  if (aaSettlePending.load()) {
-    if (pendingSettlePage && section && pendingSettleSpineIdx == currentSpineIndex &&
-        pendingSettlePageIdx == section->currentPage && SETTINGS.textAntiAliasing) {
-      LOG_DBG("ERS", "AA settle: rendering grayscale pass for page %d", pendingSettlePageIdx);
-      renderAaSettle();  // takes ownership of pendingSettlePage and frees it
-      clearAaSettle();
-      return;
-    }
-    // Stale stash — drop it here on the render task (clearAaSettle only touches
-    // flags), then let the normal render proceed.
-    pendingSettlePage.reset();
-    clearAaSettle();
   }
 
   const auto showPendingSyncSaveError = [this]() {
@@ -1189,66 +1151,6 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
               tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
     }
   }
-}
-
-void EpubReaderActivity::clearAaSettle() {
-  // Flags only — deliberately does NOT free pendingSettlePage. This is called
-  // from the UI task (pageTurn/onExit) as well as the render task, but the page
-  // object is rendered by the render task in renderAaSettle(). Freeing it here
-  // would race that render and free the Page mid-draw (use-after-free crash in
-  // Page::render). The page is owned solely by the render task: renderAaSettle()
-  // moves it into a local, and a stale stash is dropped on the render task in
-  // render(). See the render() settle-dispatch block.
-  aaSettlePending.store(false);
-  pendingSettleSpineIdx = -1;
-  pendingSettlePageIdx = -1;
-  settleAlreadyRequested = false;
-}
-
-void EpubReaderActivity::renderAaSettle() {
-  // Take ownership of the stashed page for the duration of this render. The page
-  // is render-task-owned (see clearAaSettle): moving it into a local guarantees
-  // it stays alive across all the render() passes below even if a concurrent
-  // pageTurn() on the UI task clears the settle. The local frees it on return.
-  std::unique_ptr<Page> page = std::move(pendingSettlePage);
-  if (!page) {
-    return;
-  }
-
-  // Heap gate: cheap early-out. The settle runs three full page->render() passes
-  // (one prewarm scan + LSB + MSB) plus a BW re-render. After a rapid burst the
-  // heap is already fragmented from BLE activity; if it's tight, skip the settle
-  // entirely — the BW frame already on screen is acceptable graceful degradation.
-  const size_t freeHeap = esp_get_free_heap_size();
-  const size_t maxAlloc = ESP.getMaxAllocHeap();
-  if (freeHeap < ReaderUtils::SETTLE_HEAP_GUARD_BYTES || maxAlloc < ReaderUtils::SETTLE_BLOCK_GUARD_BYTES) {
-    LOG_DBG("ERS", "AA settle: skipped (free=%u maxAlloc=%u min free=%u min block=%u)", static_cast<unsigned>(freeHeap),
-            static_cast<unsigned>(maxAlloc), static_cast<unsigned>(ReaderUtils::SETTLE_HEAP_GUARD_BYTES),
-            static_cast<unsigned>(ReaderUtils::SETTLE_BLOCK_GUARD_BYTES));
-    return;
-  }
-
-  const int fontId = SETTINGS.getReaderFontId();
-  const int marginLeft = pendingSettleMarginLeft;
-  const int marginTop = pendingSettleMarginTop;
-  Page* pagePtr = page.get();
-
-  auto* fcm = renderer.getFontCacheManager();
-  auto scope = fcm->createPrewarmScope();
-  // Scan pass so the prewarm scope is satisfied for any glyphs missing from cache.
-  pagePtr->render(renderer, fontId, marginLeft, marginTop);
-  scope.endScanAndPrewarm();
-
-  // skipBwStore=true: do NOT storeBwBuffer here. That ~48KB allocation fragments
-  // the heap and adds needless pressure during the grayscale pass; re-rendering
-  // the BW frame at the end is cheap and keeps the full block available.
-  ReaderUtils::renderAntiAliased(
-      renderer, [&]() { pagePtr->render(renderer, fontId, marginLeft, marginTop); },
-      [&]() {
-        pagePtr->render(renderer, fontId, marginLeft, marginTop);
-        renderStatusBar();
-      },
-      /*skipBwStore=*/true);
 }
 
 void EpubReaderActivity::renderStatusBar() const {
