@@ -54,7 +54,7 @@ bool BaseTheme::showBluetoothStatusIndicator() {
   // Top status bar (drawHeader): always show whenever BT is on, regardless of
   // the Customize Status Bar toggle. The toggle only governs the reader
   // status bar — see showBluetoothStatusIndicatorInReader().
-  auto& btMgr = BluetoothHIDManager::getInstance();
+  const auto& btMgr = BluetoothHIDManager::getInstance();
   // SETTINGS.bluetoothEnabled is the persisted *preference*, not the live radio
   // state. It only implies BT is actually usable this session if the controller
   // memory was reserved at boot; if it was released, enable() is refused and the
@@ -853,11 +853,10 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   }
 
   // Draw Clock (X3 only — DS3231 RTC)
-  int clockTextWidth = 0;
   if (SETTINGS.statusBarClock && halClock.isAvailable()) {
     char timeBuf[9];
     if (halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
-      clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      int clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
       // Position to the left of the progress text (with a small gap)
       const int clockX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin - orientedMarginRight -
                          progressTextWidth - (progressTextWidth > 0 ? 10 : 0) - clockTextWidth;

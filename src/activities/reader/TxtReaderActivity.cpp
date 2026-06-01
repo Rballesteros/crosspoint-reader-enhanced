@@ -290,6 +290,21 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
       // line in place to avoid an allocation per iteration.
       size_t breakPos = line.length();
       while (breakPos > 0) {
+        // We already know the full line is too wide (checked above).
+        // Find the next break position.
+        if (breakPos == line.length()) {
+          size_t spacePos = line.rfind(' ', breakPos - 1);
+          if (spacePos != std::string::npos && spacePos > 0) {
+            breakPos = spacePos;
+          } else {
+            breakPos--;
+            while (breakPos > 0 && (line[breakPos] & 0xC0) == 0x80) {
+              breakPos--;
+            }
+          }
+          if (breakPos == 0) break;
+        }
+
         const char saved = line[breakPos];
         line[breakPos] = '\0';
         const int prefixWidth = renderer.getTextWidth(cachedFontId, line.c_str());

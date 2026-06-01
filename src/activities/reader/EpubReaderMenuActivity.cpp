@@ -127,7 +127,7 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
   // Line 3: "Chapter X/Y  Pages A/B  |  Z%" with each segment conditional.
   char metaBuf[128];
   char* p = metaBuf;
-  char* const end = metaBuf + sizeof(metaBuf);
+  const char* const end = metaBuf + sizeof(metaBuf);
   if (chapterNumber > 0) {
     if (chapterCount > 0) {
       p += snprintf(p, end - p, "%s%d/%d  ", tr(STR_CHAPTER_LABEL), chapterNumber, chapterCount);

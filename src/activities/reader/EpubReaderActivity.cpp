@@ -909,9 +909,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
-  static int retryCount = 0;
-
   {
+    static int retryCount = 0;
     auto p = section->loadPageFromSectionFile();
     if (!p) {
       LOG_ERR("ERS", "Failed to load page from SD - clearing section cache");
